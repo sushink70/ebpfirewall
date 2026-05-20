@@ -346,20 +346,20 @@ WHAT IT DOES IN OUR FIREWALL:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  Network Interface (eth1)                                   │
-│  ↓ packets arrive at driver level                          │
+│  ↓ packets arrive at driver level                           │
 ├─────────────────────────────────────────────────────────────┤
-│  C / XDP Program (kernel space)                            │
-│  - Header parsing, map lookup, XDP_DROP / XDP_PASS         │
-│  - BPF maps: LPM trie, hash map, per-CPU counters          │
+│  C / XDP Program (kernel space)                             │
+│  - Header parsing, map lookup, XDP_DROP / XDP_PASS          │
+│  - BPF maps: LPM trie, hash map, per-CPU counters           │
 ├─────────────────────────────────────────────────────────────┤
-│  Rust / Aya Control Plane (userspace)                      │
-│  - Loads BPF object, attaches XDP hook                     │
-│  - Reads/writes BPF maps (the "bridge" between planes)     │
-│  - Unix socket server for management commands              │
+│  Rust / Aya Control Plane (userspace)                       │
+│  - Loads BPF object, attaches XDP hook                      │
+│  - Reads/writes BPF maps (the "bridge" between planes)      │
+│  - Unix socket server for management commands               │
 ├─────────────────────────────────────────────────────────────┤
-│  Go / Management API + CLI (userspace)                     │
-│  - REST/gRPC API for operators                             │
-│  - CLI tool, rule persistence, Prometheus metrics          │
+│  Go / Management API + CLI (userspace)                      │
+│  - REST/gRPC API for operators                              │
+│  - CLI tool, rule persistence, Prometheus metrics           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -381,10 +381,10 @@ Operator / Admin
              ▼
 ┌─────────────────────────────┐
 │  Rust: ebpfw-ctrl           │   ← Control plane
-│  (Aya / libbpf-rs)         │     BPF object loader
-│  - map: BLOCKLIST (LPM)    │     XDP attacher
-│  - map: RULES (hash)       │     Rule→map translator
-│  - map: COUNTERS (percpu)  │     Stats aggregator
+│  (Aya / libbpf-rs)          │     BPF object loader
+│  - map: BLOCKLIST (LPM)     │     XDP attacher
+│  - map: RULES (hash)        │     Rule→map translator
+│  - map: COUNTERS (percpu)   │     Stats aggregator
 └────────────┬────────────────┘
              │ BPF syscall (bpf_map_update_elem)
              ▼
@@ -392,7 +392,7 @@ Operator / Admin
 │  C: xdp_firewall.c          │   ← Kernel datapath
 │  Compiled → xdp_firewall.o  │     Runs in ENA driver hook
 │                             │     Zero SKB allocation
-│  parse eth → ip → tcp/udp  │     Line-rate DROP/PASS
+│  parse eth → ip → tcp/udp   │     Line-rate DROP/PASS
 │  lookup map → action        │
 │  update counter             │
 └────────────┬────────────────┘
@@ -1382,7 +1382,7 @@ NIC RX Ring
 │  XDP_DRV  (Native / Driver mode)                        │  ← EARLIEST: inside the driver,
 │  Runs inside the NIC driver's NAPI poll loop.           │    no sk_buff allocated yet.
 │  No sk_buff allocated — packet is a raw page frame.     │    ~10–40 Mpps/core on good NICs.
-│  Driver must implement ndo_bpf() + xdp_xmit().         │
+│  Driver must implement ndo_bpf() + xdp_xmit().          │
 └─────────────────────────────────────────────────────────┘
      │  (if driver has no XDP support)
      ▼
@@ -1542,25 +1542,25 @@ and need to verify CO-RE portability against an older kernel. Keep it as a secon
 ## 4. Lab Topology
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Lab Server (bare metal)                   │
-│                                                             │
+┌────────────────────────────────────────────────────────────┐
+│                    Lab Server (bare metal)                 │
+│                                                            │
 │  ┌─────────────┐      ┌────────────────────────────────┐   │
-│  │  eth0       │      │  Intel X710-DA2 (i40e driver)   │   │
-│  │  (1G mgmt)  │      │  ┌──────────┐  ┌──────────┐   │   │
-│  │  SSH / API  │      │  │  enp4s0f0│  │  enp4s0f1│   │   │
-│  └─────────────┘      │  │  (RX/XDP)│  │  (TX/fwd)│   │   │
-│                        │  └────┬─────┘  └────┬─────┘   │   │
-│                        └───────┼─────────────┼──────────┘   │
-│                                │             │              │
-└────────────────────────────────┼─────────────┼──────────────┘
-                                 │ DAC cable   │ DAC cable
-                            ┌────┴─────────────┴────┐
-                            │   Traffic Generator    │
-                            │  (second server OR     │
-                            │   same server with     │
-                            │   network namespaces)  │
-                            └───────────────────────-┘
+│  │  eth0       │      │  Intel X710-DA2 (i40e driver)  │   │
+│  │  (1G mgmt)  │      │  ┌──────────┐  ┌──────────┐    │   │
+│  │  SSH / API  │      │  │  enp4s0f0│  │  enp4s0f1│    │   │
+│  └─────────────┘      │  │  (RX/XDP)│  │  (TX/fwd)│    │   │
+│                       │  └────┬─────┘  └────┬─────┘    │   │
+│                       └───────┼─────────────┼──────────┘   │
+│                               │             │              │
+└───────────────────────────────┼─────────────┼──────────────┘
+                                │ DAC cable   │ DAC cable
+                           ┌────┴─────────────┴─────┐
+                           │   Traffic Generator    │
+                           │  (second server OR     │
+                           │   same server with     │
+                           │   network namespaces)  │
+                           └────────────────────────┘
 
 Control plane path:
   Go HTTP API server (port 8080)
@@ -1732,7 +1732,7 @@ The firewall is split into three planes with strict language-to-plane mapping:
 │  │  • Health check: detects if XDP program is still attached          │  │
 │  │  • Config persistence: rules in SQLite/YAML, replays on restart    │  │
 │  └──────────────────────────────┬─────────────────────────────────────┘  │
-│                                 │ cilium/ebpf map.Update() / map.Lookup() │
+│                                 │cilium/ebpf map.Update() / map.Lookup() │
 └─────────────────────────────────┼────────────────────────────────────────┘
                                   │ BPF maps (kernel pinned at /sys/fs/bpf/)
 ┌─────────────────────────────────┼────────────────────────────────────────┐
@@ -1757,14 +1757,14 @@ The firewall is split into three planes with strict language-to-plane mapping:
 │  │  xdp_firewall.c (C + libbpf + CO-RE)                               │  │
 │  │  • Compiled to BPF bytecode by Clang/LLVM                          │  │
 │  │  • Verified and JIT-compiled by the kernel                         │  │
-│  │  • Runs per-packet, inside i40e/mlx5 NAPI poll (no sk_buff)       │  │
-│  │  • Parses: ETH → IP → TCP/UDP headers in ≤ 512 bytes stack        │  │
+│  │  • Runs per-packet, inside i40e/mlx5 NAPI poll (no sk_buff)        │  │
+│  │  • Parses: ETH → IP → TCP/UDP headers in ≤ 512 bytes stack         │  │
 │  │  • Lookups: bpf_map_lookup_elem() on blocklist / allowlist maps    │  │
 │  │  • Actions: XDP_DROP, XDP_PASS, XDP_TX                             │  │
 │  │  • Telemetry: bpf_ringbuf_submit() for blocked-flow events         │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  Runs at: kernel/driver level — BEFORE sk_buff allocation               │
+│  Runs at: kernel/driver level — BEFORE sk_buff allocation                │
 └──────────────────────────────────────────────────────────────────────────┘
 
 Why this split?
