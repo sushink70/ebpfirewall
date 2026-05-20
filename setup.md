@@ -964,3 +964,378 @@ Now I have everything I need. Let me build the comprehensive setup document.Here
 **On the three-language architecture** — writing the eBPF program in C aligns with most production-grade open source projects like Cilium and Tracee, and because much of the eBPF ecosystem documentation assumes C, it makes it easier to understand, reuse, and extend existing examples. The userspace logic can remain in Rust, giving safety and modern tooling while relying on a stable foundation for kernel interaction. Go then handles the operator-facing management layer where HTTP APIs and concurrency patterns shine.
 
 The two critical ENA prerequisites (MTU → 3498, halve the channel count) are fully documented with persistence commands for Ubuntu 24.04's netplan.
+
+# eBPFirewall — GCP vs AWS for XDP/eBPF Lab
+
+> **Short answer:** Yes, GCP can run XDP/eBPF. But for this specific lab on a free plan, **AWS is the better choice.** This document explains exactly why, with no hand-waving.
+
+---
+
+## Table of Contents
+
+1. [GCP's Virtual NIC Landscape](#1-gcps-virtual-nic-landscape)
+2. [XDP Support Status per GCP NIC Type](#2-xdp-support-status-per-gcp-nic-type)
+3. [GCP Free Tier Reality](#3-gcp-free-tier-reality)
+4. [The Core Problem: e2-micro vs t3.small](#4-the-core-problem-e2-micro-vs-t3small)
+5. [GCP Setup Path (if you still choose GCP)](#5-gcp-setup-path-if-you-still-choose-gcp)
+6. [Side-by-Side Comparison: AWS vs GCP](#6-side-by-side-comparison-aws-vs-gcp)
+7. [Final Verdict](#7-final-verdict)
+
+---
+
+## 1. GCP's Virtual NIC Landscape
+
+GCP has **two** virtual NIC types, and which one your VM gets depends entirely on the machine generation. This matters a lot for XDP.
+
+### virtio-net (1st and 2nd generation machines)
+
+The classic Linux `virtio-net` driver. This is what e2-micro, n1-standard, and other older machine series use. Virtio-net **does** support XDP native mode in the upstream Linux kernel — but with a painful prerequisite: GRO hardware offload (`GRO_HW`) and checksum offload (`CSUM`) must be disabled before the kernel will allow an XDP program to attach.
+
+```bash
+# Required before loading XDP on virtio-net
+sudo ethtool -K ens4 gro off
+sudo ethtool -K ens4 tx off rx off
+
+# If GCP's hypervisor doesn't allow this, you get:
+# "virtio_net: Can't set XDP while host is implementing GRO_HW/CSUM"
+```
+
+The catch: GCP's Andromeda hypervisor controls what offloads are exposed to the guest. In practice, disabling these offloads is not always permitted on all GCP VM types, and the error message above is a common failure report from users attempting native XDP on standard GCP VMs with virtio-net.
+
+### gVNIC / gve (3rd generation and newer machines)
+
+GCP's own virtual NIC, called **gVNIC**, with the Linux kernel driver named `gve`. This is the successor to virtio-net and is mandatory for 3rd-generation and later machine series (N2, C2, C3, N4, C4, etc.).
+
+The good news: **gVNIC explicitly added native XDP support.** From the official Google driver repository:
+
+> Driver-mode XDP support was introduced in release 1.3.4 for the GQI QPL queue format and 1.4.6 for the DQO RDA queue format.
+
+The XDP queue requirement is identical to AWS ENA: RX and TX queue counts must each be set to no more than half their maximum values before attaching an XDP program.
+
+```bash
+# Check current queues on gVNIC interface
+ethtool -l ens4
+
+# Reduce to half maximum (example: max 4, set to 2)
+sudo ethtool -L ens4 rx 2 tx 2
+```
+
+**However** — gVNIC machines (N2, C2, C3, etc.) are **not in the always-free tier.** More on this below.
+
+---
+
+## 2. XDP Support Status per GCP NIC Type
+
+| NIC Driver | Machine Generation | XDP Native | Condition | Free Tier |
+|---|---|---|---|---|
+| `virtio-net` | E2, N1, N2 (1st/2nd gen) | ⚠️ Conditional | Must disable GRO_HW + CSUM offloads — GCP hypervisor may block this | e2-micro = Always Free |
+| `gve` (gVNIC) | N2, C2, C3, N4, C4 (3rd gen+) | ✅ Native | Queue halving required (same as ENA). Driver >= 1.3.4 needed | **NOT free** |
+
+### The virtio-net XDP native situation in detail
+
+The Linux kernel's virtio-net driver does have XDP native support, but it requires the host (GCP's hypervisor) to configure the TAP device with enough queues: `queues = 2 × vCPUs`. If the hypervisor doesn't expose the right queue configuration, the kernel will refuse native XDP and emit:
+
+```
+libbpf: Kernel error message: virtio_net: XDP expects header/data 
+in single page, any_header_sg required
+```
+
+or:
+
+```
+virtio_net: Can't set XDP while host is implementing GRO_HW/CSUM, 
+disable GRO_HW/CSUM first
+```
+
+On the e2-micro (GCP's free VM), these errors are commonly encountered because the shared-core hypervisor configuration does not expose the required queue/offload setup for native XDP. XDP generic mode works fine on e2-micro — but that offers no performance advantage over iptables.
+
+---
+
+## 3. GCP Free Tier Reality
+
+GCP has two distinct free tiers. They are very different from each other and from AWS.
+
+### Always Free — Permanent, no expiry
+
+```
+Instance:  e2-micro only (2 shared vCPU, 1 GB RAM)
+Duration:  Forever — does not expire
+Region:    ONLY us-west1, us-central1, or us-east1
+Storage:   30 GB standard persistent disk
+Egress:    1 GB outbound per month to internet
+```
+
+Key facts about e2-micro:
+- It is a **shared-core** machine: each vCPU gets only 12.5% of a physical core's time
+- 1 GB RAM is tight even for basic development; Rust + LLVM compilation will OOM-kill
+- Uses **virtio-net** — native XDP is problematic (GRO_HW/CSUM issue)
+- Only the e2-micro qualifies — e2-small, n1-standard-1, and all other types charge immediately
+
+### Free Trial — $300 credits, 90 days
+
+```
+Credits:   $300 USD
+Duration:  90 days from account creation (NOT 6 months)
+Instances: Any type, including N2, C2 (gVNIC, native XDP capable)
+Limit:     Credits exhausted or 90 days — whichever comes first
+```
+
+The trial gives you access to proper machines with gVNIC, but 90 days is half the time you'd get on AWS's 6-month plan. For a learn-at-your-own-pace lab, this is a real constraint.
+
+---
+
+## 4. The Core Problem: e2-micro vs t3.small
+
+This is the crux of why AWS wins for this specific project.
+
+```
+                        GCP e2-micro            AWS t3.small
+                        (Always Free)           (Free, post-Jul 2025)
+────────────────────────────────────────────────────────────────────
+Free duration           Forever                 6 months
+vCPU                    2 (shared, 12.5% ea)    2 (dedicated burst)
+RAM                     1 GB                    2 GB  ← critical
+Hypervisor              KVM (shared-core)       Nitro
+NIC driver              virtio-net              ENA (gve analog)
+XDP native mode         ⚠️ Problematic          ✅ Confirmed working
+XDP generic mode        ✅ Works                ✅ Works
+Rust build (aya)        ❌ OOM likely           ✅ Fits in 2 GB
+LLVM/clang build        ❌ OOM likely           ✅ Fits in 2 GB
+MTU issue for XDP       No                      Yes (fix: set to 3498)
+Queue halving needed    Yes (virtio-net)        Yes (ENA)
+Cost after free period  ~$6/month               ~$17/month (paid)
+```
+
+### RAM is the blocking issue
+
+Compiling eBPF programs with Clang/LLVM and running the Rust toolchain simultaneously consumes 1.5–2 GB of RAM during a build. On the e2-micro's 1 GB, the kernel OOM killer will terminate your build processes. You would need to create a large swap file on the standard persistent disk — which is slow HDD-backed storage on e2-micro's "standard persistent disk" — making every Rust compile extremely slow.
+
+On AWS t3.small with 2 GB, builds complete normally.
+
+---
+
+## 5. GCP Setup Path (if you still choose GCP)
+
+If you have reasons to prefer GCP (familiarity, existing $300 trial credits, Google ecosystem), here is the correct path to get native XDP working.
+
+### Option A: Use the $300 trial with a proper gVNIC machine
+
+**Recommended instance: `n2-standard-2`**
+
+```
+vCPU: 2 (dedicated)
+RAM:  8 GB
+NIC:  gVNIC (gve driver, native XDP supported)
+Cost: ~$0.097/hour → ~$70/month if running 24/7
+      With $300 trial: ~4 months of continuous use, or longer if you stop it
+```
+
+```bash
+# Create the instance with gVNIC explicitly enabled
+gcloud compute instances create ebpfirewall-dev \
+  --zone=us-central1-a \
+  --machine-type=n2-standard-2 \
+  --image-family=ubuntu-2404-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=30GB \
+  --boot-disk-type=pd-ssd \
+  --network-interface=nic-type=GVNIC
+```
+
+> ⚠️ Stop the instance when not working to conserve trial credits. At ~$0.097/hr, 8 hours/day for 90 days ≈ $70, well within $300.
+
+### Option B: e2-micro with XDP generic mode (free forever, limited learning)
+
+If you want the truly free path and can accept XDP generic mode:
+
+```bash
+# e2-micro: always free in us-central1
+gcloud compute instances create ebpfirewall-dev \
+  --zone=us-central1-a \
+  --machine-type=e2-micro \
+  --image-family=ubuntu-2404-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=30GB \
+  --boot-disk-type=pd-standard
+```
+
+Then set up a large swap file to survive builds:
+
+```bash
+# 4 GB swap file on the standard persistent disk
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Reduce swappiness so RAM is used first
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+```
+
+**What you lose:** No XDP native mode (GRO_HW issue on e2-micro). Your XDP programs run in generic/SKB mode. You can still learn all the eBPF map logic, BPF verifier rules, and control plane architecture — the C/Rust/Go code is identical. You just cannot benchmark real XDP native performance.
+
+### GCP gVNIC XDP Prerequisites (equivalent to ENA steps)
+
+When using gVNIC on a proper machine (n2-standard-2 etc.):
+
+```bash
+# Check interface name (GCP uses ens4, not eth0/eth1)
+ip link show
+# GCP interface is typically: ens4 (primary), ens5 (secondary)
+
+# Add a second NIC for safe XDP experimentation
+# (via GCP Console → VM → Edit → Network interfaces → Add NIC)
+# OR via gcloud:
+gcloud compute instances network-interfaces add ebpfirewall-dev \
+  --zone=us-central1-a \
+  --network=default \
+  --nic-type=GVNIC
+
+# After reboot, check for ens5 (second NIC)
+ip link show
+
+# Halve the queue count before loading XDP
+ethtool -l ens5
+# Pre-set maximums: RX: 4, TX: 4 (example for n2-standard-2)
+sudo ethtool -L ens5 rx 2 tx 2
+
+# NO MTU change needed — gVNIC does not have the ENA jumbo frame restriction
+# (gVNIC default MTU is 1460, already XDP-compatible)
+
+# Verify driver version
+ethtool -i ens5 | grep driver
+# driver: gve
+# version: 1.x.x  (must be >= 1.3.4 for GQI-QPL, >= 1.4.6 for DQO-RDA)
+
+# Install the out-of-tree driver if Ubuntu ships an older version:
+# git clone https://github.com/GoogleCloudPlatform/compute-virtual-ethernet-linux
+# cd compute-virtual-ethernet-linux
+# make -C /lib/modules/$(uname -r)/build M=$(pwd)/build modules modules_install
+```
+
+### GCP gVNIC vs ENA: Key Differences
+
+| Aspect | AWS ENA | GCP gVNIC |
+|---|---|---|
+| MTU reduction needed | Yes (9001 → 3498) | No (default is 1460) |
+| Queue halving needed | Yes (combined) | Yes (rx + tx separately) |
+| Queue syntax | `ethtool -L ethX combined N` | `ethtool -L ensX rx N tx N` |
+| Driver min version | ENA >= 2.2.0 | gve >= 1.3.4 (GQI-QPL) |
+| XDP_DROP / XDP_PASS | ✅ | ✅ |
+| XDP_TX | ⚠️ (TX ring = 1024) | ✅ (no TX ring limitation reported) |
+| AF_XDP zero-copy | ✅ (with queue restriction) | ✅ |
+| Interface name | eth0, eth1 | ens4, ens5 |
+
+One genuine advantage of gVNIC: **no MTU reduction required.** GCP's gVNIC defaults to 1460 MTU (standard Ethernet minus overhead), which is already XDP-compatible. No `ip link set mtu 3498` step needed.
+
+---
+
+## 6. Side-by-Side Comparison: AWS vs GCP
+
+```
+CATEGORY              AWS                         GCP
+────────────────────────────────────────────────────────────────────────────────
+Free instance         t3.small                    e2-micro
+                      (2 vCPU, 2 GB, Nitro)       (2 shared vCPU, 1 GB, KVM)
+
+Free duration         6 months (new plan)         Always (forever)
+                      12 months (old plan)         $300 trial = 90 days
+
+XDP native (free)     ✅ ENA, confirmed            ⚠️ virtio-net, problematic
+                                                   ❌ gVNIC requires paid VM
+
+RAM for builds        ✅ 2 GB, adequate            ❌ 1 GB, OOM-kill risk
+                                                   (need swap workaround)
+
+Second NIC for lab    ✅ Attach ENI easily         ✅ Add NIC via gcloud/console
+
+MTU config needed     Yes (9001 → 3498)           No (already 1460)
+
+Queue halving needed  Yes (combined)              Yes (rx + tx separate)
+
+Interface name        eth0 / eth1                 ens4 / ens5
+
+Ubuntu 24.04 support  ✅ Native AMI               ✅ Native image
+
+Kernel version        6.8 (Ubuntu 24.04)          6.8 (Ubuntu 24.04)
+
+Out-of-tree driver?   Not needed (ENA >= 2.x      May need if gve < 1.3.4
+                       in Ubuntu 24.04)             (check: ethtool -i ens4)
+
+Trial credit trap     No — usage tracked by        Yes — $300 runs out after
+                       hours/instance type          90 days of even moderate use
+
+Best use case         This XDP firewall lab        General cloud learning,
+                                                   longer-lived always-free VM
+```
+
+---
+
+## 7. Final Verdict
+
+### Choose AWS if:
+
+- Your account was created after July 15, 2025 → **t3.small is free** and gives you confirmed ENA native XDP with 2 GB RAM
+- You want the cleanest, most documented XDP-on-cloud experience (ENA has more community write-ups)
+- You plan to work on this for 3–6 months (the full free plan duration)
+- You want to follow the existing `setup.md` without major changes
+
+### Choose GCP if:
+
+- You already have $300 in GCP trial credits and want to use them
+- You are comfortable spending a few dollars and want gVNIC's cleaner XDP_TX behavior (no TX ring limitation)
+- You want an always-free VM to keep notes/reference code on (e2-micro for management plane only, do XDP work on a paid VM you spin up and stop)
+- Your team or employer is a Google shop
+
+### The hybrid approach (best of both)
+
+If you're committed to GCP for the long term, consider this split:
+
+```
+GCP e2-micro (always free, forever):
+  → Run the Go management API
+  → Store firewall rules in YAML
+  → Serve the metrics endpoint
+  → Keep the repo
+
+GCP n2-standard-2 (spin up only when doing XDP work, ~$0.10/hr):
+  → Load the XDP C program
+  → Run the Rust control plane
+  → Do all eBPF experimentation
+  → STOP the instance after each session
+  → Total cost: 4 hours/day × 30 days = ~$12/month
+```
+
+This maximizes the always-free tier while keeping XDP work on a machine that actually supports it natively.
+
+---
+
+## Summary Table: Which Cloud, Which Path
+
+| Your Situation | Recommendation |
+|---|---|
+| AWS account (post-Jul 2025) | **AWS t3.small** — free, 2 GB, ENA native XDP ✅ |
+| AWS account (pre-Jul 2025) | **AWS t3.micro** + 4 GB swap — ENA native XDP, tight on RAM |
+| GCP with $300 trial credits | **GCP n2-standard-2** with gVNIC — stop when not using |
+| GCP always-free only | **Generic XDP mode only** on e2-micro + larger paid VM on demand |
+| No preference | **AWS** for this specific lab, no contest |
+
+Now I have everything I need for a thorough GCP vs AWS comparison. Let me build the document.Yes, GCP can run XDP/eBPF — but there are real complications specific to your free lab setup. Here is the honest picture:
+
+**GCP has two NIC types, and they behave very differently:**
+
+gVNIC is GCP's next-generation network interface that replaces VirtIO-Net as the only supported interface for all new machine types (Generation 3 and onwards). Older machines use the standard `virtio-net` driver. Driver-mode XDP support for gVNIC was introduced in release 1.3.4 for the GQI QPL queue format and 1.4.6 for the DQO RDA queue format, with the same requirement as ENA: RX and TX queues must be set to no more than half their maximum values before attaching an XDP program.
+
+**The free tier problem is serious:**
+
+Only the e2-micro qualifies for the Always Free compute tier — an e2-small, n1-standard-1, or any other machine type charges immediately, even in a free-tier US region. The e2-micro is a shared-core machine with only **1 GB RAM**, uses `virtio-net` (not gVNIC), and attempting native XDP on it frequently fails with hypervisor-blocked offload errors. GCP's $300 trial credit lasts only **90 days** — not 6 months.
+
+**The key differences are captured in the document:**
+
+- **AWS t3.small** (free, post-Jul 2025): 2 GB RAM, Nitro, ENA native XDP confirmed working — best fit for this lab
+- **GCP e2-micro** (always free, forever): 1 GB RAM, virtio-net, native XDP problematic — RAM alone kills Rust/LLVM builds
+- **GCP n2-standard-2** (gVNIC, $0.10/hr): proper native XDP, no MTU reduction needed (gVNIC defaults to 1460), but you're spending trial credits
+
+One genuine advantage gVNIC has over ENA: **no MTU reduction step required** and no TX ring size limitation for XDP_TX, which could matter later when you add more advanced features. But for a free-plan lab, that advantage doesn't compensate for the free-tier RAM and driver constraints.
