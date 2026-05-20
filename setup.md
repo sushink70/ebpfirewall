@@ -1339,3 +1339,1069 @@ Only the e2-micro qualifies for the Always Free compute tier — an e2-small, n1
 - **GCP n2-standard-2** (gVNIC, $0.10/hr): proper native XDP, no MTU reduction needed (gVNIC defaults to 1460), but you're spending trial credits
 
 One genuine advantage gVNIC has over ENA: **no MTU reduction step required** and no TX ring size limitation for XDP_TX, which could matter later when you add more advanced features. But for a free-plan lab, that advantage doesn't compensate for the free-tier RAM and driver constraints.
+
+# XDP/eBPF Firewall — Native NIC Lab Setup Guide
+
+> **Scope of this document:** Extends your existing AWS/GCP cloud research with the ground truth on
+> bare-metal/native NIC setup — hardware selection, OS comparison, toolchain installation, and the
+> three-language (C / Rust / Go) firewall architecture with component boundaries.
+
+---
+
+## Table of Contents
+
+1. [XDP Mode Primer — Why Native Matters](#1-xdp-mode-primer)
+2. [NIC Hardware — What Supports Native XDP](#2-nic-hardware)
+3. [OS Selection — Ubuntu 24.04 vs RHEL 9/10](#3-os-selection)
+4. [Lab Topology](#4-lab-topology)
+5. [OS & Kernel Configuration](#5-os--kernel-configuration)
+6. [Toolchain Installation](#6-toolchain-installation)
+7. [Three-Language Architecture — Where Each Language Lives](#7-three-language-architecture)
+8. [C: XDP Kernel Data Plane](#8-c-xdp-kernel-data-plane)
+9. [Rust (Aya): Control Plane & Map Management](#9-rust-aya-control-plane)
+10. [Go (cilium/ebpf): Management API & Rule Engine](#10-go-management-api)
+11. [BPF Map Schema — Shared State Across Languages](#11-bpf-map-schema)
+12. [Loading & Verifying the Program](#12-loading--verifying)
+13. [NIC-Specific Quirks & Tuning](#13-nic-specific-quirks)
+14. [Traffic Generator for Lab Testing](#14-traffic-generator)
+15. [Debugging Toolkit](#15-debugging-toolkit)
+16. [Cloud vs Native — Decision Matrix](#16-cloud-vs-native-decision-matrix)
+
+---
+
+## 1. XDP Mode Primer
+
+XDP has three execution modes. The mode determines **where** your eBPF program runs and, critically,
+how early it intercepts a packet.
+
+```
+NIC RX Ring
+     │
+     ▼
+┌─────────────────────────────────────────────────────────┐
+│  XDP_DRV  (Native / Driver mode)                        │  ← EARLIEST: inside the driver,
+│  Runs inside the NIC driver's NAPI poll loop.           │    no sk_buff allocated yet.
+│  No sk_buff allocated — packet is a raw page frame.     │    ~10–40 Mpps/core on good NICs.
+│  Driver must implement ndo_bpf() + xdp_xmit().         │
+└─────────────────────────────────────────────────────────┘
+     │  (if driver has no XDP support)
+     ▼
+┌─────────────────────────────────────────────────────────┐
+│  XDP_SKB  (Generic mode)                                │  ← LATE: after sk_buff alloc.
+│  Works on ANY NIC. Runs in the generic kernel path.     │    ~1–2 Mpps/core. Essentially
+│  sk_buff is allocated, then discarded on XDP_DROP.      │    same cost as iptables. No gain.
+└─────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─────────────────────────────────────────────────────────┐
+│  XDP_HW  (Hardware Offload)                             │  ← ON-CHIP: program runs on NIC
+│  Program runs ON the NIC's embedded processor.          │    processor, zero host CPU usage.
+│  Currently supported only by Netronome Agilio SmartNIC. │    Extremely limited helper set.
+└─────────────────────────────────────────────────────────┘
+```
+
+**For a firewall lab: you want `XDP_DRV` (native mode).** Generic mode gives you correctness but not
+performance — if you're using XDP just to avoid iptables overhead, generic mode defeats that entirely.
+
+### XDP Return Codes Used in a Firewall
+
+| Code        | Action                                         | Use Case                          |
+|-------------|------------------------------------------------|-----------------------------------|
+| `XDP_DROP`  | Drop packet at driver level, recycle RX buffer | Block rules, DDoS mitigation      |
+| `XDP_PASS`  | Hand packet up to kernel network stack         | Allowed traffic                   |
+| `XDP_TX`    | Retransmit packet back out the same interface  | Reflection attacks, loopback test |
+| `XDP_ABORTED` | Drop + increment `xdp_exception` counter     | Bug/error path (not production)   |
+| `XDP_REDIRECT` | Forward to another interface or CPU queue   | Load balancer, XSK (AF_XDP)       |
+
+---
+
+## 2. NIC Hardware
+
+### Native XDP Driver Support Matrix
+
+| Vendor        | NIC Family            | Driver    | Speed        | XDP Native | XDP ZeroCopy (AF_XDP) | Lab Cost (Used) |
+|---------------|-----------------------|-----------|--------------|------------|------------------------|-----------------|
+| **Intel**     | X710 / XL710          | `i40e`    | 10G / 40G    | ✅ Yes     | ✅ Yes                 | $30–80 USD      |
+| **Intel**     | X520 / 82599ES        | `ixgbe`   | 10G          | ✅ Yes     | ✅ Yes                 | $15–40 USD      |
+| **Intel**     | E810 series           | `ice`     | 25G / 100G   | ✅ Yes     | ✅ Yes                 | $150–300 USD    |
+| **Mellanox**  | ConnectX-3 / ConnectX-3 Pro | `mlx4` | 10G / 40G | ✅ Yes  | ✅ Yes                 | $20–60 USD      |
+| **Mellanox**  | ConnectX-4 / 5 / 6   | `mlx5`    | 25G / 100G   | ✅ Yes     | ✅ Yes (quirky*)       | $50–200 USD     |
+| **Broadcom**  | BCM57414 / QL41xxx    | `bnxt_en` | 25G          | ✅ Yes     | ✅ Yes                 | $80–150 USD     |
+| **Qlogic**    | FastLinQ 41000        | `qede`    | 25G          | ✅ Yes     | Partial                | $50–120 USD     |
+| **Virtio**    | virtio-net (KVM/QEMU) | `virtio_net` | 1G–10G  | ✅ Yes     | ✅ Yes                 | Free (VM)       |
+| **Netronome** | Agilio SmartNIC       | `nfp`     | 10G–40G      | ✅ Yes     | ✅ Yes + **HW Offload**| $400–800 USD    |
+| **Realtek**   | RTL8111/8168          | `r8169`   | 1G           | ❌ No      | ❌ No                  | $5              |
+| **Intel**     | I219-LM / I211        | `e1000e` / `igb` | 1G | ❌ No    | ❌ No                  | $10–20          |
+
+> **Key takeaway:** Consumer/desktop NICs (Realtek, Intel I219) do **not** support native XDP.
+> You need a server-class NIC — the Intel X710 or Mellanox ConnectX-4/5 are the sweet spot for a lab.
+
+### Recommended Hardware for This Lab
+
+```
+Budget Lab (best ROI for eBPF firewall development):
+  ─────────────────────────────────────────────────────
+  NIC  : Intel X710-DA2 (dual 10G SFP+)
+  Why  : i40e driver ships in every modern kernel.
+         Native XDP, AF_XDP zero-copy, SR-IOV, full
+         ethtool stats. Excellent community documentation.
+         Used cards: $30–80 USD on eBay/AliExpress.
+  Conn : SFP+ DAC cable (copper, passive) ~$8 USD.
+         No switch needed for back-to-back lab topology.
+
+  Server: Any x86 with PCIe x8 Gen3 slot.
+           16 GB RAM minimum for build toolchains.
+           8-core CPU (separate cores for NIC queues and
+           IRQ affinity). Dell R620/R720 are common lab servers.
+
+Mid-Range Lab (25G, future-proof):
+  ─────────────────────────────────────────────────────
+  NIC  : Mellanox ConnectX-5 25G (MCX512A-ACAT)
+  Why  : mlx5 driver, best-in-class XDP performance.
+         Hardware metadata offload (RSS, checksum, timestamps).
+         ConnectX-5 is what Azure/OVH use in their hypervisors.
+  Note : mlx5 AF_XDP zero-copy uses separate queue IDs.
+         If you have N queues, XDP_ZEROCOPY uses queues [N..2N).
+         You must halve queue count: ethtool -L <iface> combined N/2.
+
+HW Offload Lab (program runs on-NIC):
+  ─────────────────────────────────────────────────────
+  NIC  : Netronome Agilio CX 2x10GbE (AGILIO-CX-2X10)
+  Why  : Only NIC with true XDP hardware offload (XDP_HW).
+         eBPF bytecode executes on the NIC's flow processor.
+         Zero host CPU for dropped/redirected packets.
+  Note : Subset of BPF helpers available.
+         Not needed for a firewall (XDP_DROP + XDP_PASS work in HW).
+```
+
+### How to Verify Your NIC Supports Native XDP (After Boot)
+
+```bash
+# Method 1: Check for ndo_bpf in driver (most reliable)
+ethtool -i <interface>        # note the "driver:" line
+# Then check kernel source: grep -r "ndo_bpf" drivers/net/ethernet/<vendor>/
+
+# Method 2: Try to load in native mode and see if it falls back
+ip link set <interface> xdp obj xdp_drop.o sec xdp
+ip link show <interface>
+# Output contains "xdp"      → native mode loaded ✅
+# Output contains "xdpgeneric" → fallback, native NOT supported ❌
+
+# Method 3: bpftool (most explicit)
+bpftool net show dev <interface>
+
+# Method 4: Enumerate all XDP-capable drivers in your kernel
+grep -r 'XDP_SETUP_PROG' /usr/src/linux-headers-$(uname -r)/include/ 2>/dev/null || \
+  find /lib/modules/$(uname -r)/kernel/drivers/net -name "*.ko" | xargs modinfo 2>/dev/null \
+  | grep -i xdp
+```
+
+---
+
+## 3. OS Selection
+
+### Ubuntu 24.04 LTS vs RHEL 9 (Developer Subscription — Free)
+
+| Dimension                    | Ubuntu 24.04 LTS                              | RHEL 9.x                                          |
+|------------------------------|-----------------------------------------------|---------------------------------------------------|
+| **Kernel version**           | 6.8 (HWE: 6.11+)                             | 5.14 (RHEL9) / 6.12 (RHEL10)                     |
+| **BTF embedded in kernel**   | ✅ Yes (`/sys/kernel/btf/vmlinux` present)   | ✅ Yes (since RHEL 8.2+)                          |
+| **CO-RE support**            | ✅ Full (libbpf ships as system package)     | ✅ Full                                           |
+| **libbpf package**           | `apt install libbpf-dev` (0.8+)              | `dnf install libbpf-devel` (backported)           |
+| **bpftool**                  | `apt install linux-tools-$(uname -r)`        | `dnf install bpftool`                             |
+| **Clang/LLVM version**       | Clang 18 (default)                           | Clang 17 (via LLVM toolset)                       |
+| **Kernel BTF freshness**     | Tracks upstream closely                      | Backports; older struct layouts than upstream     |
+| **XDP verifier strictness**  | Upstream verifier (latest)                   | Backport verifier — may accept programs Ubuntu rejects, or vice versa |
+| **i40e driver version**      | Ships with kernel 6.8 (i40e 2.x)            | Separate `kmod-i40e` RPM may be needed            |
+| **mlx5 driver**              | Ships in-tree                                | Ships in-tree + MLNX_OFED available for extras    |
+| **Rust toolchain**           | Manual install via rustup                    | Manual install via rustup                         |
+| **Go toolchain**             | Manual install or snap                       | Manual install                                    |
+| **Developer friction**       | Low — `apt` resolves most dependencies       | Medium — some headers in `*-devel` separate RPMs  |
+| **SELinux / AppArmor**       | AppArmor (less restrictive for BPF by default) | SELinux (can block BPF loading — needs policy)  |
+| **Subscription cost**        | Free                                         | Free (Red Hat Developer Program, max 16 systems)  |
+| **Kernel HWE**               | Available: 6.11+ on 24.04 via HWE stack     | Upgrade to RHEL 10 for 6.12                       |
+
+### Verdict
+
+**Use Ubuntu 24.04 for this lab.** Reasons:
+
+1. Kernel 6.8 ships with the latest verifier fixes and XDP features. RHEL 9 ships kernel 5.14 —
+   a 3-year-old kernel that lacks several modern BPF map types and XDP helpers you'll want.
+2. `libbpf-dev`, `bpftool`, `linux-headers-*` are all in the same package manager with no
+   version mismatch hunting.
+3. AppArmor does not block `CAP_NET_ADMIN` / `CAP_BPF` by default. RHEL's SELinux requires
+   policy tuning before `bpf()` syscalls work.
+4. Aya (Rust eBPF framework) and cilium/ebpf (Go) both test primarily against upstream kernels —
+   Ubuntu's kernel is closest to that.
+
+**Use RHEL 9 if:** you are targeting production deployment on RHEL/CentOS enterprise environments
+and need to verify CO-RE portability against an older kernel. Keep it as a secondary test machine.
+
+---
+
+## 4. Lab Topology
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Lab Server (bare metal)                   │
+│                                                             │
+│  ┌─────────────┐      ┌────────────────────────────────┐   │
+│  │  eth0       │      │  Intel X710-DA2 (i40e driver)   │   │
+│  │  (1G mgmt)  │      │  ┌──────────┐  ┌──────────┐   │   │
+│  │  SSH / API  │      │  │  enp4s0f0│  │  enp4s0f1│   │   │
+│  └─────────────┘      │  │  (RX/XDP)│  │  (TX/fwd)│   │   │
+│                        │  └────┬─────┘  └────┬─────┘   │   │
+│                        └───────┼─────────────┼──────────┘   │
+│                                │             │              │
+└────────────────────────────────┼─────────────┼──────────────┘
+                                 │ DAC cable   │ DAC cable
+                            ┌────┴─────────────┴────┐
+                            │   Traffic Generator    │
+                            │  (second server OR     │
+                            │   same server with     │
+                            │   network namespaces)  │
+                            └───────────────────────-┘
+
+Control plane path:
+  Go HTTP API server (port 8080)
+    └─→ Rust Aya daemon
+          └─→ BPF map updates (bpf_map_update_elem)
+                └─→ C XDP program reads maps on every packet
+
+Data plane path (per-packet, kernel space only):
+  NIC RX ring
+    └─→ i40e NAPI poll
+          └─→ [XDP C program runs here]
+                ├─→ XDP_DROP   (blocked src IP / port)
+                ├─→ XDP_PASS   (allowed, sk_buff allocated)
+                └─→ XDP_TX     (reflect back — for testing)
+```
+
+### Back-to-Back Lab Without a Switch
+
+Connect `enp4s0f0` ↔ `enp4s0f1` with a SFP+ DAC cable. Load XDP only on `enp4s0f0`.
+Use `enp4s0f1` as the traffic injection/generation interface.
+Keep `eth0` (the onboard 1G NIC) strictly for SSH — never load XDP on it.
+
+---
+
+## 5. OS & Kernel Configuration
+
+### Ubuntu 24.04 — Fresh Install Hardening for eBPF
+
+```bash
+# 1. Verify kernel version and BTF presence
+uname -r                             # should be 6.8.x or higher
+ls /sys/kernel/btf/vmlinux           # must exist for CO-RE
+
+# 2. Enable BPF JIT hardening (recommended — prevents JIT spraying attacks)
+echo 1 > /proc/sys/net/core/bpf_jit_enable
+echo 1 > /proc/sys/net/core/bpf_jit_harden
+# Persist:
+cat >> /etc/sysctl.d/99-ebpf.conf << 'EOF'
+net.core.bpf_jit_enable = 1
+net.core.bpf_jit_harden = 1
+kernel.unprivileged_bpf_disabled = 1
+EOF
+sysctl --system
+
+# 3. Increase locked memory limit (needed for large BPF maps)
+cat >> /etc/security/limits.conf << 'EOF'
+*    soft    memlock    unlimited
+*    hard    memlock    unlimited
+EOF
+# Also set in systemd service unit: LimitMEMLOCK=infinity
+
+# 4. Enable huge pages (optional, improves XDP ring buffer performance)
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+# Persist:
+echo 'vm.nr_hugepages = 1024' >> /etc/sysctl.d/99-ebpf.conf
+
+# 5. Mount BPF filesystem (usually auto-mounted on 24.04, verify)
+mount | grep bpf
+# If not mounted:
+mount -t bpf bpf /sys/fs/bpf
+# Add to /etc/fstab: none /sys/fs/bpf bpf defaults 0 0
+```
+
+### RHEL 9 — Additional Steps
+
+```bash
+# SELinux: Allow BPF program loading (create a policy module)
+# Quick dev workaround (NOT for production):
+setenforce 0   # or audit2allow to build proper policy
+
+# Enable BPF syscall (disabled by some RHEL security profiles)
+sysctl -w kernel.unprivileged_bpf_disabled=1   # prevents non-root BPF
+
+# Install DKMS and kernel headers (required for out-of-tree NIC drivers)
+dnf install -y kernel-devel kernel-headers dkms
+
+# For i40e (Intel X710): driver ships in-tree but may need update
+# Check: modinfo i40e | grep version
+# If < 2.x: download from https://sourceforge.net/projects/e1000/files/i40e%20stable/
+```
+
+---
+
+## 6. Toolchain Installation
+
+### Complete Toolchain (Ubuntu 24.04)
+
+```bash
+# ── Core BPF dependencies ────────────────────────────────────────────────
+sudo apt update && sudo apt install -y \
+  clang-18 llvm-18 llvm-18-dev \
+  libbpf-dev \
+  linux-headers-$(uname -r) \
+  linux-tools-$(uname -r) linux-tools-generic \
+  bpftool \
+  pkg-config libelf-dev zlib1g-dev \
+  iproute2 \
+  ethtool \
+  pahole \            # generates vmlinux.h via bpftool btf dump
+  make gcc
+
+# Verify libbpf version (need >= 0.8 for modern CO-RE)
+dpkg -l libbpf-dev | tail -1
+
+# ── xdp-tools (libxdp + xdp-loader) ─────────────────────────────────────
+# libxdp enables multi-program dispatch on a single interface
+git clone --recurse-submodules https://github.com/xdp-project/xdp-tools.git
+cd xdp-tools
+./configure
+make -j$(nproc)
+sudo make install
+sudo ldconfig
+
+# ── Generate vmlinux.h (kernel type definitions for CO-RE) ───────────────
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+# This replaces including dozens of kernel headers in your C XDP programs.
+
+# ── Rust toolchain ────────────────────────────────────────────────────────
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source ~/.cargo/env
+rustup install stable
+rustup target add bpfel-unknown-none  # BPF target (little-endian)
+
+# Aya — Rust eBPF framework
+cargo install bpf-linker            # LLVM-based BPF linker for Aya
+cargo install cargo-generate        # project templating
+# Aya project scaffold:
+cargo generate --git https://github.com/aya-rs/aya-template \
+  --name ebpfirewall
+
+# ── Go toolchain ─────────────────────────────────────────────────────────
+GO_VERSION=1.22.4
+wget -q https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go${GO_VERSION}.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+go version
+
+# cilium/ebpf — Go eBPF library
+mkdir -p ~/go/src/ebpfirewall-api && cd ~/go/src/ebpfirewall-api
+go mod init ebpfirewall-api
+go get github.com/cilium/ebpf@latest
+go get github.com/vishvananda/netlink@latest   # for interface management
+
+# ── Verify everything ─────────────────────────────────────────────────────
+clang-18 --version | head -1
+bpftool version
+cargo --version
+go version
+bpftool feature probe | grep bpf_prog_type_xdp
+```
+
+---
+
+## 7. Three-Language Architecture
+
+The firewall is split into three planes with strict language-to-plane mapping:
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                        MANAGEMENT PLANE (Go)                             │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐  │
+│  │  ebpfirewall-api (Go + cilium/ebpf)                                │  │
+│  │  • REST/gRPC API: add/delete/list firewall rules                   │  │
+│  │  • Rule compilation: IP/port/proto → BPF map key-value             │  │
+│  │  • Stats polling: reads per-rule packet/byte counters from maps    │  │
+│  │  • Health check: detects if XDP program is still attached          │  │
+│  │  • Config persistence: rules in SQLite/YAML, replays on restart    │  │
+│  └──────────────────────────────┬─────────────────────────────────────┘  │
+│                                 │ cilium/ebpf map.Update() / map.Lookup() │
+└─────────────────────────────────┼────────────────────────────────────────┘
+                                  │ BPF maps (kernel pinned at /sys/fs/bpf/)
+┌─────────────────────────────────┼────────────────────────────────────────┐
+│                        CONTROL PLANE (Rust)                              │
+│                                 │                                        │
+│  ┌──────────────────────────────▼─────────────────────────────────────┐  │
+│  │  ebpfirewall-ctrl (Rust + Aya)                                     │  │
+│  │  • Program lifecycle: compile, load, attach/detach XDP program     │  │
+│  │  • Map initialization: create pinned maps on startup               │  │
+│  │  • Hot-reload: swap XDP programs without traffic interruption      │  │
+│  │  • Event loop: reads ring_buf / perf_event_array from kernel       │  │
+│  │  • Alert pipeline: blocked-flow events → stdout / syslog           │  │
+│  │  • Topology: manages multi-interface attach (one prog per NIC)     │  │
+│  └──────────────────────────────┬─────────────────────────────────────┘  │
+│                                 │ Aya Program::load() / Link::attach()   │
+└─────────────────────────────────┼────────────────────────────────────────┘
+                                  │ XDP program object file (.o)
+┌─────────────────────────────────┼────────────────────────────────────────┐
+│                        DATA PLANE (C)                                    │
+│                                 │                                        │
+│  ┌──────────────────────────────▼─────────────────────────────────────┐  │
+│  │  xdp_firewall.c (C + libbpf + CO-RE)                               │  │
+│  │  • Compiled to BPF bytecode by Clang/LLVM                          │  │
+│  │  • Verified and JIT-compiled by the kernel                         │  │
+│  │  • Runs per-packet, inside i40e/mlx5 NAPI poll (no sk_buff)       │  │
+│  │  • Parses: ETH → IP → TCP/UDP headers in ≤ 512 bytes stack        │  │
+│  │  • Lookups: bpf_map_lookup_elem() on blocklist / allowlist maps    │  │
+│  │  • Actions: XDP_DROP, XDP_PASS, XDP_TX                             │  │
+│  │  • Telemetry: bpf_ringbuf_submit() for blocked-flow events         │  │
+│  └────────────────────────────────────────────────────────────────────┘  │
+│                                                                          │
+│  Runs at: kernel/driver level — BEFORE sk_buff allocation               │
+└──────────────────────────────────────────────────────────────────────────┘
+
+Why this split?
+  C      → Only language the BPF verifier accepts for kernel-space programs.
+            Precise memory model, manual bounds checking, no heap allocation.
+  Rust   → Memory safety for the loader/event loop without garbage collection.
+            Aya's type-safe BPF map wrappers catch type mismatches at compile time.
+            Async event processing (Tokio) for ring buffer draining.
+  Go     → Rapid API development, HTTP/gRPC server, database I/O.
+            cilium/ebpf provides idiomatic Go access to pinned maps.
+            Go's garbage collector is acceptable here — this is not the hot path.
+```
+
+---
+
+## 8. C: XDP Kernel Data Plane
+
+### `xdp_firewall.c` — Annotated Production-Grade Example
+
+```c
+// SPDX-License-Identifier: GPL-2.0
+#include "vmlinux.h"           // CO-RE: generated from /sys/kernel/btf/vmlinux
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+
+// ── Map Definitions ──────────────────────────────────────────────────────
+// Key: source IPv4 address (network byte order)
+// Value: action (0 = PASS, 1 = DROP)
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);   // Longest Prefix Match for CIDR rules
+    __uint(max_entries, 65536);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct bpf_lpm_trie_key);  // {prefixlen, data[4]}
+    __type(value, __u32);                  // action
+} ip_blocklist SEC(".maps");
+
+// Per-CPU counters: avoid atomic ops on hot path
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 2);                // [0]=pass_count, [1]=drop_count
+    __type(key, __u32);
+    __type(value, __u64);
+} stats SEC(".maps");
+
+// Ring buffer for blocked-flow events (read by Rust control plane)
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);          // 16 MB ring
+} events SEC(".maps");
+
+// ── Event struct sent to userspace ───────────────────────────────────────
+struct firewall_event {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u8  proto;
+    __u8  action;    // 0 = DROP, 1 = PASS
+    __u64 timestamp; // bpf_ktime_get_ns()
+};
+
+// ── XDP Program Entry Point ───────────────────────────────────────────────
+SEC("xdp")
+int xdp_firewall_prog(struct xdp_md *ctx)
+{
+    void *data_end = (void *)(long)ctx->data_end;
+    void *data     = (void *)(long)ctx->data;
+
+    // ── Parse Ethernet header ────────────────────────────────────────────
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+        return XDP_PASS;   // malformed: let kernel handle
+
+    // Skip non-IPv4 (ARP, IPv6 handled separately)
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
+
+    // ── Parse IP header ──────────────────────────────────────────────────
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
+        return XDP_PASS;
+
+    // ── LPM lookup: is src IP in blocklist? ──────────────────────────────
+    struct {
+        __u32 prefixlen;
+        __u32 addr;
+    } lpm_key = {
+        .prefixlen = 32,
+        .addr = ip->saddr,
+    };
+
+    __u32 *action = bpf_map_lookup_elem(&ip_blocklist, &lpm_key);
+
+    if (action && *action == 1) {
+        // ── Emit event to ring buffer ────────────────────────────────────
+        struct firewall_event *ev;
+        ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
+        if (ev) {
+            ev->src_ip    = ip->saddr;
+            ev->dst_ip    = ip->daddr;
+            ev->proto     = ip->protocol;
+            ev->action    = 0;  // DROP
+            ev->timestamp = bpf_ktime_get_ns();
+
+            // Parse L4 ports if TCP/UDP
+            if (ip->protocol == IPPROTO_TCP) {
+                struct tcphdr *tcp = (void *)(ip + 1);
+                if ((void *)(tcp + 1) <= data_end) {
+                    ev->src_port = bpf_ntohs(tcp->source);
+                    ev->dst_port = bpf_ntohs(tcp->dest);
+                }
+            } else if (ip->protocol == IPPROTO_UDP) {
+                struct udphdr *udp = (void *)(ip + 1);
+                if ((void *)(udp + 1) <= data_end) {
+                    ev->src_port = bpf_ntohs(udp->source);
+                    ev->dst_port = bpf_ntohs(udp->dest);
+                }
+            }
+            bpf_ringbuf_submit(ev, 0);
+        }
+
+        // ── Update drop counter ──────────────────────────────────────────
+        __u32 key = 1;
+        __u64 *cnt = bpf_map_lookup_elem(&stats, &key);
+        if (cnt) __sync_fetch_and_add(cnt, 1);
+
+        return XDP_DROP;
+    }
+
+    // ── Update pass counter ──────────────────────────────────────────────
+    __u32 key = 0;
+    __u64 *cnt = bpf_map_lookup_elem(&stats, &key);
+    if (cnt) __sync_fetch_and_add(cnt, 1);
+
+    return XDP_PASS;
+}
+
+char _license[] SEC("license") = "GPL";
+```
+
+### Compile the XDP Program
+
+```bash
+# Generate vmlinux.h first (once per kernel version)
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# Compile to BPF bytecode
+clang-18 -O2 -g -Wall \
+  -target bpf \
+  -D__TARGET_ARCH_x86 \
+  -I. \
+  -c xdp_firewall.c \
+  -o xdp_firewall.o
+
+# Inspect the compiled object
+llvm-objdump-18 -S xdp_firewall.o
+bpftool prog dump xlated file xdp_firewall.o  # after loading
+```
+
+---
+
+## 9. Rust (Aya): Control Plane
+
+### Project Structure
+
+```
+ebpfirewall-ctrl/
+├── Cargo.toml
+├── src/
+│   ├── main.rs          ← Tokio async runtime, CLI, program lifecycle
+│   ├── loader.rs        ← load_xdp_program(), attach(), detach(), hot_reload()
+│   ├── maps.rs          ← typed BPF map wrappers (LpmTrie, PerfEventArray, RingBuf)
+│   └── events.rs        ← ring buffer drain loop → alert pipeline
+└── xtask/
+    └── main.rs          ← build script: compile C XDP program via clang
+```
+
+### Key Aya Snippets
+
+```rust
+// Cargo.toml dependencies:
+// aya = { version = "0.13", features = ["async_tokio"] }
+// aya-log = "0.2"
+// tokio = { version = "1", features = ["full"] }
+
+use aya::{Bpf, programs::{Xdp, XdpFlags}};
+use aya::maps::lpm_trie::{LpmTrie, Key};
+use aya::maps::RingBuf;
+use std::net::Ipv4Addr;
+
+pub struct FirewallLoader {
+    bpf: Bpf,
+    iface: String,
+}
+
+impl FirewallLoader {
+    /// Load XDP object file and attach to interface in native mode.
+    pub fn load_and_attach(obj_path: &str, iface: &str) -> anyhow::Result<Self> {
+        let mut bpf = Bpf::load_file(obj_path)?;
+
+        let program: &mut Xdp = bpf.program_mut("xdp_firewall_prog")
+            .unwrap()
+            .try_into()?;
+
+        program.load()?;
+
+        // XdpFlags::DRV_MODE = native/driver mode
+        // XdpFlags::SKB_MODE = generic fallback
+        program.attach(iface, XdpFlags::DRV_MODE)?;
+
+        Ok(Self { bpf, iface: iface.to_string() })
+    }
+
+    /// Insert a CIDR block rule into the LPM trie.
+    pub fn block_cidr(&mut self, cidr: Ipv4Addr, prefix_len: u32) -> anyhow::Result<()> {
+        let mut map: LpmTrie<_, [u8; 4], u32> =
+            LpmTrie::try_from(self.bpf.map_mut("ip_blocklist")?)?;
+
+        let key = Key::new(prefix_len, cidr.octets());
+        let action: u32 = 1; // DROP
+        map.insert(&key, action, 0)?;
+        Ok(())
+    }
+
+    /// Drain the ring buffer and process blocked-flow events.
+    pub async fn drain_events(&mut self) -> anyhow::Result<()> {
+        let ring_buf = RingBuf::try_from(self.bpf.map_mut("events")?)?;
+
+        loop {
+            // Non-blocking poll; integrate with tokio::io::AsyncFd for production
+            while let Some(item) = ring_buf.next() {
+                let event = parse_firewall_event(&item);
+                log::warn!("BLOCKED: src={} dst={} proto={} ts={}",
+                    Ipv4Addr::from(event.src_ip),
+                    Ipv4Addr::from(event.dst_ip),
+                    event.proto,
+                    event.timestamp);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+```
+
+---
+
+## 10. Go: Management API
+
+### API Server with cilium/ebpf
+
+```go
+// main.go — HTTP management API
+package main
+
+import (
+    "encoding/binary"
+    "encoding/json"
+    "log"
+    "net"
+    "net/http"
+
+    "github.com/cilium/ebpf"
+    "github.com/cilium/ebpf/rlimit"
+)
+
+// Must match the C struct layout exactly (use __u32 for both fields)
+type LpmKey struct {
+    Prefixlen uint32
+    Addr      [4]byte
+}
+
+type FirewallAPI struct {
+    blocklist *ebpf.Map // opened from pinned path /sys/fs/bpf/ip_blocklist
+    stats     *ebpf.Map // opened from pinned path /sys/fs/bpf/stats
+}
+
+func NewFirewallAPI() (*FirewallAPI, error) {
+    // Remove memlock limit (required for BPF map operations)
+    if err := rlimit.RemoveMemlock(); err != nil {
+        return nil, err
+    }
+
+    blocklist, err := ebpf.LoadPinnedMap("/sys/fs/bpf/ip_blocklist", nil)
+    if err != nil {
+        return nil, err
+    }
+    stats, err := ebpf.LoadPinnedMap("/sys/fs/bpf/stats", nil)
+    if err != nil {
+        return nil, err
+    }
+    return &FirewallAPI{blocklist: blocklist, stats: stats}, nil
+}
+
+// POST /rules/block {"cidr": "192.168.1.0/24"}
+func (fw *FirewallAPI) BlockHandler(w http.ResponseWriter, r *http.Request) {
+    var req struct{ CIDR string `json:"cidr"` }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, err.Error(), 400)
+        return
+    }
+
+    ip, ipnet, err := net.ParseCIDR(req.CIDR)
+    if err != nil {
+        http.Error(w, "invalid CIDR", 400)
+        return
+    }
+
+    prefixLen, _ := ipnet.Mask.Size()
+    key := LpmKey{Prefixlen: uint32(prefixLen)}
+    copy(key.Addr[:], ip.To4())
+
+    var action uint32 = 1 // DROP
+    if err := fw.blocklist.Update(key, action, ebpf.UpdateAny); err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+
+    w.WriteHeader(http.StatusNoContent)
+}
+
+// GET /stats → {"pass": N, "drop": N}
+func (fw *FirewallAPI) StatsHandler(w http.ResponseWriter, r *http.Request) {
+    var passKey, dropKey uint32 = 0, 1
+    var passVal, dropVal []uint64 // per-CPU values
+
+    if err := fw.stats.Lookup(passKey, &passVal); err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+    if err := fw.stats.Lookup(dropKey, &dropVal); err != nil {
+        http.Error(w, err.Error(), 500)
+        return
+    }
+
+    // Sum across CPUs
+    var totalPass, totalDrop uint64
+    for _, v := range passVal { totalPass += v }
+    for _, v := range dropVal { totalDrop += v }
+
+    json.NewEncoder(w).Encode(map[string]uint64{
+        "pass": totalPass,
+        "drop": totalDrop,
+    })
+}
+
+func main() {
+    fw, err := NewFirewallAPI()
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    http.HandleFunc("/rules/block", fw.BlockHandler)
+    http.HandleFunc("/stats", fw.StatsHandler)
+
+    log.Println("Management API listening on :8080")
+    log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+---
+
+## 11. BPF Map Schema
+
+Maps are the shared memory between all three language components. Pin them to the BPF filesystem
+so all processes can access them independently.
+
+```
+/sys/fs/bpf/
+├── xdp_firewall_prog       ← pinned program link (managed by Rust loader)
+├── ip_blocklist            ← LPM_TRIE: CIDR → action (written by Go, read by C)
+├── stats                   ← PERCPU_ARRAY: pass/drop counters (written by C, read by Go)
+└── events                  ← RINGBUF: blocked-flow events (written by C, drained by Rust)
+
+Map Type Selection Rationale:
+  ip_blocklist  → BPF_MAP_TYPE_LPM_TRIE
+                  Supports /24, /16, /8 CIDR blocks natively.
+                  O(log n) lookup. Max 65536 entries for a lab.
+                  Alternative: BPF_MAP_TYPE_HASH for exact /32 lookups (O(1)).
+
+  stats         → BPF_MAP_TYPE_PERCPU_ARRAY
+                  Each CPU updates its own slot → no atomic contention.
+                  Userspace sums all CPU values on read.
+                  Zero false sharing — critical on multi-queue NICs.
+
+  events        → BPF_MAP_TYPE_RINGBUF (kernel 5.8+)
+                  Single ring, multiple producers (CPUs), one consumer (Rust).
+                  Does NOT copy data — zero-copy reserve/submit model.
+                  Replaced BPF_MAP_TYPE_PERF_EVENT_ARRAY for most use cases.
+```
+
+---
+
+## 12. Loading & Verifying
+
+```bash
+# ── Step 1: Pin maps (done by Rust loader on startup, shown manually here) ─
+# The Rust/Aya loader creates and pins maps automatically from the .o file.
+# Manually with bpftool (for debugging):
+bpftool map create /sys/fs/bpf/ip_blocklist \
+  type lpm_trie key 8 value 4 entries 65536 name ip_blocklist flags 1
+
+# ── Step 2: Load and attach XDP program ─────────────────────────────────
+# Via Rust loader (recommended):
+./ebpfirewall-ctrl --iface enp4s0f0 --obj xdp_firewall.o
+
+# OR manually via ip link (for testing):
+ip link set enp4s0f0 xdp obj xdp_firewall.o sec xdp
+# ^ Use "xdpdrv" flag to FORCE native mode (fail if not supported):
+ip link set enp4s0f0 xdpdrv obj xdp_firewall.o sec xdp
+
+# ── Step 3: Verify mode ──────────────────────────────────────────────────
+ip link show enp4s0f0
+# Look for: "xdp" (native) vs "xdpgeneric" (fallback)
+
+bpftool net show dev enp4s0f0
+# Output: xdp:
+#   xdp_firewall_prog  id 42  tag a1b2c3d4e5f6a7b8  jited
+
+# ── Step 4: Insert a block rule ─────────────────────────────────────────
+# Via Go API:
+curl -X POST http://localhost:8080/rules/block \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr":"198.51.100.0/24"}'
+
+# OR directly via bpftool (for testing):
+# LPM key = prefixlen (4 bytes BE) + addr (4 bytes)
+bpftool map update pinned /sys/fs/bpf/ip_blocklist \
+  key hex 00 00 00 20 c6 33 64 00 \
+  value hex 01 00 00 00
+
+# ── Step 5: Verify stats ─────────────────────────────────────────────────
+curl http://localhost:8080/stats
+# {"pass": 1234567, "drop": 89}
+
+# ── Step 6: Detach (safe, traffic resumes immediately) ───────────────────
+ip link set enp4s0f0 xdp off
+```
+
+---
+
+## 13. NIC-Specific Quirks & Tuning
+
+### Intel X710 (i40e)
+
+```bash
+# ── MTU: X710 supports jumbo frames up to 9706 bytes. XDP native requires
+# packets fit in one buffer. For 1500B MTU frames, default is fine.
+# If you see XDP load failures: reduce MTU first.
+ip link set enp4s0f0 mtu 1500
+
+# ── Queue count: match XDP queues to CPU count for IRQ affinity
+# Check current queues:
+ethtool -l enp4s0f0
+
+# Set to number of available CPUs (or half for RX+TX separation):
+ethtool -L enp4s0f0 combined 4   # for a 4-core machine
+
+# ── IRQ affinity: pin each queue to a specific CPU
+# Prevents cross-CPU interrupts from destroying cache locality.
+# i40e ships a script for this:
+# /usr/local/lib/i40e/set_irq_affinity.sh 0,1,2,3 enp4s0f0
+
+# ── Disable GRO/LRO: XDP processes individual frames; GRO merges them.
+# GRO is automatically disabled in native XDP mode. Verify:
+ethtool -k enp4s0f0 | grep receive-offload
+
+# ── RSS hash key: for symmetric hashing (src/dst are interchangeable)
+# Useful when XDP redirect is used to load-balance flows.
+ethtool -X enp4s0f0 hfunc toeplitz
+```
+
+### Mellanox ConnectX-5 (mlx5)
+
+```bash
+# ── AF_XDP zero-copy quirk: mlx5 uses separate queue IDs for zero-copy.
+# Normal queues: [0..N), zero-copy queues: [N..2N).
+# To use zero-copy AF_XDP, halve the queue count first:
+ethtool -l enp1s0     # check combined max
+ethtool -L enp1s0 combined 16   # if max is 32, set to 16
+
+# ── Channel type: mlx5 uses "combined" channels by default.
+# For RX-only XDP workloads, you CAN use rx/tx channels separately.
+
+# ── VLAN stripping: disable if your XDP program needs VLAN headers
+ethtool -K enp1s0 rx-vlan-offload off
+
+# ── Firmware update (sometimes required for new XDP features):
+# Check: ethtool -i enp1s0 | grep firmware
+# Update via mstflint or MLNX_OFED mstconfig tool.
+```
+
+---
+
+## 14. Traffic Generator for Lab Testing
+
+Without a second server, use network namespaces to simulate traffic on the same machine.
+
+```bash
+# ── Setup: two namespaces connected via veth pair ────────────────────────
+ip netns add generator
+ip netns add receiver
+
+ip link add veth-gen type veth peer name veth-recv
+ip link set veth-gen netns generator
+ip link set veth-recv netns receiver
+
+ip netns exec generator ip addr add 10.10.0.1/24 dev veth-gen
+ip netns exec receiver  ip addr add 10.10.0.2/24 dev veth-recv
+ip netns exec generator ip link set veth-gen up
+ip netns exec receiver  ip link set veth-recv up
+
+# Load XDP on veth-recv (note: veth supports native XDP since kernel 4.20)
+ip netns exec receiver ip link set veth-recv xdpdrv obj xdp_firewall.o sec xdp
+
+# ── pktgen (kernel packet generator — highest rate) ──────────────────────
+modprobe pktgen
+# See /proc/net/pktgen/ for per-thread configuration
+
+# ── hping3 (flexible, good for firewall rule testing) ────────────────────
+sudo apt install -y hping3
+# Flood test (SYN from a blocked IP range):
+ip netns exec generator hping3 --flood --syn -p 80 \
+  --spoof 198.51.100.50 10.10.0.2
+
+# ── iperf3 (throughput baseline) ─────────────────────────────────────────
+ip netns exec receiver  iperf3 -s &
+ip netns exec generator iperf3 -c 10.10.0.2 -t 30 -P 4
+
+# ── scapy (precise packet crafting for protocol edge cases) ──────────────
+pip install scapy --break-system-packages
+ip netns exec generator python3 - << 'EOF'
+from scapy.all import *
+# Craft a packet from blocked CIDR to test drop:
+pkt = Ether()/IP(src="198.51.100.1", dst="10.10.0.2")/TCP(dport=443)
+sendp(pkt, iface="veth-gen", count=1000, inter=0.001)
+EOF
+```
+
+---
+
+## 15. Debugging Toolkit
+
+```bash
+# ── 1. Verify JIT compilation ────────────────────────────────────────────
+bpftool prog show name xdp_firewall_prog
+# Look for "jited" — means BPF bytecode → native x86_64 instructions ✅
+# If "not jited": check bpf_jit_enable sysctl
+
+# ── 2. Dump JIT output (native x86_64 assembly) ─────────────────────────
+bpftool prog dump jited name xdp_firewall_prog
+
+# ── 3. Trace verifier output (if program is rejected) ────────────────────
+# The kernel logs verifier errors to dmesg:
+dmesg | tail -50 | grep -i bpf
+
+# To see full verifier log programmatically:
+bpftool prog load xdp_firewall.o /sys/fs/bpf/test_prog 2>&1
+
+# ── 4. Monitor XDP stats via ethtool ────────────────────────────────────
+watch -n1 'ethtool -S enp4s0f0 | grep -E "xdp|drop|rx_bytes"'
+
+# ── 5. BPF program tracing with bpftrace ─────────────────────────────────
+sudo apt install -y bpftrace
+# Count XDP actions per second:
+bpftrace -e 'tracepoint:xdp:xdp_exception { @[args->act] = count(); }'
+
+# ── 6. Inspect map contents ──────────────────────────────────────────────
+bpftool map dump pinned /sys/fs/bpf/ip_blocklist
+bpftool map dump pinned /sys/fs/bpf/stats
+
+# ── 7. perf record for cache/PMU stats ──────────────────────────────────
+sudo perf stat -e \
+  cache-misses,cache-references,LLC-load-misses,LLC-store-misses \
+  -a -- sleep 5
+
+# ── 8. XDP exception counter (catches XDP_ABORTED) ──────────────────────
+bpftool net show dev enp4s0f0
+ethtool -S enp4s0f0 | grep xdp_exception
+```
+
+---
+
+## 16. Cloud vs Native — Decision Matrix
+
+| Criterion                              | AWS (ENA on t3.small) | GCP (gVNIC)   | Native NIC (X710) |
+|----------------------------------------|-----------------------|---------------|-------------------|
+| XDP native mode                        | ✅ Yes (ENA ≥ 2.2)   | ✅ Yes        | ✅ Yes            |
+| XDP_TX (hairpin)                       | ⚠️ Limited (TX ring = 1024) | ⚠️ | ✅ Full           |
+| AF_XDP zero-copy                       | ✅ Yes               | ✅ Yes        | ✅ Yes            |
+| MTU reduction required for XDP        | ✅ Yes (→ 3498)      | ✅ Yes        | ❌ Not required   |
+| Queue tuning required                  | ✅ Yes               | Varies        | ✅ Recommended    |
+| Physical NIC driver control            | ❌ No (hypervisor hides NIC) | ❌ No | ✅ Full           |
+| IRQ affinity control                   | ❌ No                | ❌ No         | ✅ Full           |
+| NIC firmware update                    | ❌ No                | ❌ No         | ✅ Full           |
+| SR-IOV / VF creation                   | ❌ No                | ❌ No         | ✅ Yes            |
+| HW offload (XDP_HW)                    | ❌ No                | ❌ No         | ✅ Netronome only |
+| Hardware RSS hash key control          | ❌ No                | ❌ No         | ✅ Full           |
+| Observed peak PPS (XDP_DROP)           | ~3–5 Mpps            | ~2–4 Mpps     | ~14–20 Mpps (10G line-rate) |
+| Cost (dev lab, monthly)               | ~$15–30 USD          | ~$10–25 USD   | ~$0 (one-time $50–150 HW)  |
+| Iteration speed (redeploy)            | Fast                 | Fast          | Instant (no API round-trip) |
+| **Recommended for**                   | CI, cloud-native testing | CI        | NIC driver hacking, perf profiling |
+
+### Recommendation Summary
+
+Use **native NIC** when:
+- You need to characterize actual XDP_DRV throughput at line rate
+- You're debugging NIC driver interactions (IRQ affinity, GRO, RSS)
+- You need SR-IOV, AF_XDP zero-copy, or hardware offload experimentation
+- You want to develop without cloud egress billing
+
+Use **AWS/GCP** when:
+- You want disposable environments for CI/CD testing of correctness (not performance)
+- You're testing CO-RE portability across kernel versions (spin up different AMIs)
+- You need to replicate a specific cloud customer's deployment environment
+
+---
+
+## Quick Reference: Driver-to-NIC Mapping
+
+```
+Driver    NIC Family                      Speed       XDP Mode
+──────    ───────────────────────────────────────────────────────
+i40e      Intel X710, XL710, XXV710       10/40G      Native ✅
+ixgbe     Intel X520, 82599               10G         Native ✅
+ice       Intel E810 (Columbiaville)      25/100G     Native ✅
+mlx4      Mellanox ConnectX-3/3 Pro       10/40G      Native ✅
+mlx5      Mellanox ConnectX-4/5/6, CX-7  25–400G     Native ✅
+bnxt_en   Broadcom BCM57xxx               25G         Native ✅
+qede      QLogic FastLinQ 41xxx           25G         Native ✅
+nfp       Netronome Agilio               10/40G      Native + HW Offload ✅
+virtio_net QEMU/KVM virtual              1–10G       Native ✅
+tun/veth  Linux virtual device           N/A         Native ✅ (4.20+)
+r8169     Realtek RTL8111/8168           1G          Generic only ❌
+e1000e    Intel I219/I218 (desktop)      1G          Generic only ❌
+igb       Intel I211/I350                1G          Generic only ❌
+```
+
+---
+
+*Document version: 2025-Q2 | Kernel baseline: Linux 6.8 | libbpf: 1.x | Aya: 0.13 | cilium/ebpf: 0.16*
