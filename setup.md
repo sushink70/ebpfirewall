@@ -2405,3 +2405,3627 @@ igb       Intel I211/I350                1G          Generic only ❌
 ---
 
 *Document version: 2025-Q2 | Kernel baseline: Linux 6.8 | libbpf: 1.x | Aya: 0.13 | cilium/ebpf: 0.16*
+
+# eBPF XDP Firewall — Complete Implementation Guide
+
+> **Stack:** Linux XDP · C (kernel BPF) · Rust/Aya (control plane) · Go (management API)
+> **Target:** AWS EC2 Nitro (t3.small+) · Ubuntu 24.04 · Kernel 6.8+
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [AWS Setup & Prerequisites](#2-aws-setup--prerequisites)
+3. [Toolchain Installation](#3-toolchain-installation)
+4. [Project Structure](#4-project-structure)
+5. [C — XDP Kernel Program](#5-c--xdp-kernel-program)
+6. [Rust — Aya Control Plane](#6-rust--aya-control-plane)
+7. [Go — Management API & CLI](#7-go--management-api--cli)
+8. [Build & Deploy](#8-build--deploy)
+9. [Testing & Verification](#9-testing--verification)
+10. [Troubleshooting](#10-troubleshooting)
+
+---
+
+## 1. Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          AWS EC2 (t3.small, Nitro)                       │
+│                                                                           │
+│   ┌──────────────────────────────────────────────────────────────────┐  │
+│   │                      User Space                                    │  │
+│   │                                                                    │  │
+│   │  ┌──────────────┐    ┌──────────────────────────────────────┐    │  │
+│   │  │  Go CLI/API  │───▶│         Rust / Aya Control Plane      │    │  │
+│   │  │  (firewall   │    │  - Loads XDP program into kernel       │    │  │
+│   │  │   manage)    │    │  - Reads/writes BPF Maps (rules)       │    │  │
+│   │  └──────────────┘    │  - Monitors per-IP packet counters     │    │  │
+│   │                      └────────────────┬─────────────────────┘    │  │
+│   └───────────────────────────────────────┼──────────────────────────┘  │
+│                                            │  syscall: bpf()              │
+│   ┌───────────────────────────────────────▼──────────────────────────┐  │
+│   │                      Kernel Space                                  │  │
+│   │                                                                    │  │
+│   │   BPF Maps (shared memory)                                        │  │
+│   │   ┌─────────────────┐  ┌──────────────┐  ┌──────────────────┐   │  │
+│   │   │ blocklist_ipv4  │  │ allow_ports  │  │  stats_map       │   │  │
+│   │   │ (LPM Trie)      │  │ (Hash Map)   │  │  (per-IP counts) │   │  │
+│   │   └────────┬────────┘  └──────┬───────┘  └────────┬─────────┘   │  │
+│   │            │                  │                    │              │  │
+│   │   ┌────────▼──────────────────▼────────────────────▼──────────┐  │  │
+│   │   │               XDP Program (C / eBPF bytecode)              │  │  │
+│   │   │   - Parses Ethernet → IP → TCP/UDP headers                 │  │  │
+│   │   │   - Checks IP against LPM blocklist                        │  │  │
+│   │   │   - Checks destination port against allowlist              │  │  │
+│   │   │   - Returns XDP_DROP or XDP_PASS                           │  │  │
+│   │   └───────────────────────────────────────────────────────────┘  │  │
+│   │                         ▲                                         │  │
+│   │                         │ XDP hook (driver level, before SKB)    │  │
+│   └─────────────────────────┼──────────────────────────────────────--┘  │
+│                              │                                            │
+│   ┌──────────────────────────┴───────────────────────────────────────┐  │
+│   │   ENA NIC Driver (eth1) — Native XDP mode                        │  │
+│   │   MTU: 3498 · Combined channels: reduced · ENA driver >= 2.2.0   │  │
+│   └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why Three Languages?
+
+| Layer | Language | Role | Why |
+|---|---|---|---|
+| **Kernel** | C | XDP packet filter | Only C/restricted subset compiles to eBPF bytecode the verifier accepts |
+| **Control Plane** | Rust (Aya) | Load BPF, manage maps | Memory-safe, zero-cost abstractions; Aya has first-class eBPF support |
+| **Management Plane** | Go | REST API + CLI | Fast development, great stdlib networking, easy HTTP server |
+
+### Key Concepts
+
+**XDP (eXpress Data Path)** — A hook point in the Linux kernel that runs your eBPF program inside the NIC driver, *before* the kernel allocates an `sk_buff` (socket buffer). This is the earliest interception point — packets you drop here never touch the kernel networking stack.
+
+**BPF Maps** — Kernel-resident key/value stores that both kernel (XDP program) and user space (Rust/Go) can read and write. This is the shared state between all three layers.
+
+**LPM Trie (Longest Prefix Match)** — A kernel BPF map type specifically designed for IP subnet lookups. `192.168.0.0/16` matches before `192.168.0.0/24` loses — the longer (more specific) prefix wins. Essential for efficient CIDR-based firewalling.
+
+**Verifier** — The kernel's static analysis engine. Before any eBPF program runs, the verifier checks every possible execution path to ensure the program cannot crash the kernel, access out-of-bounds memory, or run infinite loops.
+
+---
+
+## 2. AWS Setup & Prerequisites
+
+### Instance Selection
+
+| Instance | Hypervisor | ENA | XDP Native | Notes |
+|---|---|---|---|---|
+| t2.micro | Xen | No | ❌ Generic only | Avoid |
+| t3.micro | Nitro | Yes | ✅ | Too little RAM for builds |
+| **t3.small** | **Nitro** | **Yes** | **✅** | **Recommended minimum** |
+| c7i-flex.large | Nitro v5 | Yes | ✅ + ntuple | Best performance |
+
+> **Use t3.small** — 2 vCPU, 2 GB RAM. Compiling Rust + Clang/LLVM simultaneously will OOM a t3.micro.
+
+### Step-by-Step AWS Setup
+
+```bash
+# Step 1: Launch t3.small with Ubuntu 24.04 LTS
+# Console: EC2 → Launch Instance
+# AMI: Ubuntu 24.04 LTS (ami-0c7217cdde317cfec in us-east-1)
+# Instance type: t3.small
+# Storage: 20 GB gp3
+# Security Group: allow port 22 from your IP
+
+# Step 2: Add a second ENI (CRITICAL — this is your lab interface)
+# If your XDP program crashes eth1, you keep SSH on eth0
+# Console: EC2 → Your Instance → Networking → Attach Network Interface
+# Create a new ENI in the same subnet and security group
+# After attaching, it appears as eth1 inside the instance
+
+# Step 3: Configure eth1 for XDP (run inside the instance)
+# Reduce MTU — ENA's XDP requires packets fit in one RX buffer
+# Default EC2 MTU is 9001 (jumbo frames) which breaks native XDP
+sudo ip link set eth1 mtu 3498
+
+# Reduce combined channels — XDP native needs headroom in the driver
+ethtool -l eth1                      # Check current/maximum channels
+sudo ethtool -L eth1 combined 2      # Set to half the max combined
+
+# Bring eth1 up
+sudo ip link set eth1 up
+
+# Step 4: Verify ENA driver version (must be >= 2.2.0)
+modinfo ena | grep version
+```
+
+---
+
+## 3. Toolchain Installation
+
+```bash
+sudo apt update && sudo apt install -y \
+  clang llvm \
+  libbpf-dev \
+  linux-headers-$(uname -r) \
+  bpftool \
+  iproute2 \
+  pkg-config \
+  libelf-dev \
+  linux-tools-$(uname -r) \
+  linux-tools-generic \
+  build-essential \
+  curl wget git
+
+# ── Rust ──────────────────────────────────────────────────────────────────
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Install nightly (Aya's BPF target requires it)
+rustup toolchain install nightly
+rustup component add rust-src --toolchain nightly
+
+# Install bpf-linker (Aya's LLVM-based BPF backend)
+cargo install bpf-linker
+
+# Install cargo-generate for Aya project templating
+cargo install cargo-generate
+
+# ── Go ────────────────────────────────────────────────────────────────────
+wget https://go.dev/dl/go1.22.4.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.22.4.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+
+go version   # should print go1.22.4
+
+# ── Verify everything ─────────────────────────────────────────────────────
+clang --version
+llc --version
+rustc --version
+cargo --version
+go version
+bpftool version
+```
+
+---
+
+## 4. Project Structure
+
+```
+ebpfirewall/
+├── kernel/                     # C — XDP eBPF kernel program
+│   ├── firewall.c              # Main XDP filter logic
+│   ├── firewall.h              # Shared structs and map definitions
+│   └── Makefile                # clang compilation to BPF object
+│
+├── control-plane/              # Rust — Aya-based BPF loader & map manager
+│   ├── Cargo.toml
+│   ├── build.rs                # Aya build script
+│   └── src/
+│       ├── main.rs             # Entry point: load XDP, attach to interface
+│       ├── maps.rs             # BPF map CRUD operations
+│       └── loader.rs           # Program loading and lifecycle
+│
+├── management/                 # Go — REST API + CLI firewall manager
+│   ├── go.mod
+│   ├── main.go                 # HTTP server entry point
+│   ├── api/
+│   │   ├── routes.go           # Route definitions
+│   │   └── handlers.go         # HTTP handler functions
+│   ├── bpfmaps/
+│   │   └── client.go           # Talks to Rust control plane via Unix socket
+│   └── cli/
+│       └── firewall.go         # cobra-based CLI
+│
+└── README.md
+```
+
+---
+
+## 5. C — XDP Kernel Program
+
+The C code runs **inside the kernel**. It is compiled to eBPF bytecode by Clang and verified + JIT-compiled by the kernel before execution. Every packet on `eth1` passes through this code.
+
+### `kernel/firewall.h` — Shared Definitions
+
+```c
+/* firewall.h
+ *
+ * Shared header: map key/value structs used by both the XDP C program
+ * and by user-space tools (via vmlinux.h or manual struct mirroring).
+ *
+ * All structs that go into BPF maps must be:
+ *   - Fixed-size (no pointers, no flexible arrays)
+ *   - Packed or naturally aligned (no hidden padding bytes)
+ *   - Mirrored exactly in Rust/Go user-space code
+ */
+
+#ifndef FIREWALL_H
+#define FIREWALL_H
+
+#include <linux/types.h>    /* __u8, __u16, __u32, __u64 — kernel integer types */
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * LPM (Longest Prefix Match) key for IPv4 CIDR blocking.
+ *
+ * The BPF_MAP_TYPE_LPM_TRIE key format is MANDATORY:
+ *   - First 4 bytes = prefix length in bits (e.g., 24 for /24)
+ *   - Remaining bytes = the data (the IP address, big-endian)
+ *
+ * This struct mirrors the kernel's struct bpf_lpm_trie_key exactly.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+struct lpm_key {
+    __u32 prefixlen;    /* prefix length: 0–32 for IPv4 */
+    __u32 addr;         /* IPv4 address in network byte order (big-endian) */
+};
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Per-IP statistics entry stored in the stats map.
+ *
+ * The XDP program increments these atomically using __sync_fetch_and_add.
+ * User space reads them periodically for monitoring dashboards.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+struct ip_stats {
+    __u64 packets_dropped;   /* total packets dropped from this source IP */
+    __u64 packets_passed;    /* total packets passed from this source IP */
+    __u64 bytes_dropped;     /* total bytes dropped */
+    __u64 bytes_passed;      /* total bytes passed */
+};
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Port rule value stored in the allow_ports map.
+ *
+ * Key = __u16 port number (big-endian).
+ * Value = this struct.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+struct port_rule {
+    __u8  action;     /* 0 = drop, 1 = allow */
+    __u8  protocol;   /* 0 = any, 6 = TCP, 17 = UDP */
+    __u16 pad;        /* explicit padding to avoid struct holes */
+};
+
+/* Action constants — used in port_rule.action and XDP return codes */
+#define ACTION_DROP  0
+#define ACTION_ALLOW 1
+
+/* Protocol constants */
+#define PROTO_ANY  0
+#define PROTO_TCP  6
+#define PROTO_UDP  17
+#define PROTO_ICMP 1
+
+#endif /* FIREWALL_H */
+```
+
+**Why this header matters:** BPF maps are raw binary blobs. Both the kernel C program and user-space Rust/Go code must agree byte-for-byte on struct layout. Any padding mismatch causes silent data corruption where you read garbage from map entries. The `__u32 pad` in `port_rule` is explicit — we document every padding byte.
+
+---
+
+### `kernel/firewall.c` — XDP Filter Logic
+
+```c
+/* firewall.c
+ *
+ * XDP eBPF firewall — runs in kernel space, inside the ENA NIC driver.
+ *
+ * Processing pipeline per packet:
+ *   1. Parse Ethernet header → check for IPv4
+ *   2. Parse IPv4 header → extract src IP, protocol, total length
+ *   3. Check src IP against blocklist_ipv4 LPM trie → DROP if matched
+ *   4. Parse TCP/UDP header → extract destination port
+ *   5. Check dest port against allow_ports hash map → DROP if not allowed
+ *   6. Update per-IP statistics
+ *   7. Return XDP_PASS or XDP_DROP
+ *
+ * Compilation:
+ *   clang -O2 -g -target bpf -D__TARGET_ARCH_x86 \
+ *         -I/usr/include/x86_64-linux-gnu \
+ *         -c firewall.c -o firewall.o
+ */
+
+/* BPF CO-RE (Compile Once — Run Everywhere) approach.
+ * vmlinux.h contains ALL kernel type definitions generated from BTF.
+ * This replaces dozens of #include <linux/...> headers and makes the
+ * program portable across kernel versions. */
+#include "vmlinux.h"
+
+/* libbpf BPF-side helpers — map definitions, helper functions */
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>    /* bpf_ntohs(), bpf_htons() for byte-order */
+
+#include "firewall.h"
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * BPF MAP DEFINITIONS
+ *
+ * Maps declared with SEC(".maps") are recognized by libbpf and the loader.
+ * The kernel creates these maps when the program is loaded; the loader pins
+ * them to /sys/fs/bpf/ so user space can open them by path.
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+/*
+ * blocklist_ipv4 — LPM Trie for blocked IP ranges.
+ *
+ * BPF_MAP_TYPE_LPM_TRIE: designed specifically for CIDR lookups.
+ * Lookup is O(prefix_length) — faster than a hash scan of all subnets.
+ *
+ * key_size = sizeof(struct lpm_key) = 8 bytes (4 prefixlen + 4 addr)
+ * value_size = sizeof(__u8) = 1 byte (we only care if key exists)
+ * max_entries = 10000: can hold 10k individual IPs or CIDR ranges
+ * map_flags = BPF_F_NO_PREALLOC: LPM tries MUST use this flag;
+ *   they allocate nodes on demand, not upfront.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(key_size, sizeof(struct lpm_key));
+    __uint(value_size, sizeof(__u8));
+    __uint(max_entries, 10000);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} blocklist_ipv4 SEC(".maps");
+
+/*
+ * allow_ports — Hash map of explicitly allowed destination ports.
+ *
+ * BPF_MAP_TYPE_HASH: O(1) average lookup.
+ * Default policy = DROP (allowlist model).
+ * If a port is NOT in this map, the packet is dropped.
+ * This implements a default-deny firewall.
+ *
+ * key = __u16 destination port (network byte order)
+ * value = struct port_rule (action + protocol)
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, __u16);
+    __type(value, struct port_rule);
+    __uint(max_entries, 1024);
+} allow_ports SEC(".maps");
+
+/*
+ * stats_map — Per-source-IP packet and byte counters.
+ *
+ * BPF_MAP_TYPE_PERCPU_HASH: each CPU has its own copy of the value.
+ * This eliminates contention on multi-core systems — no atomic ops needed
+ * for the kernel side. User space sums across all CPUs when reading.
+ *
+ * key = __u32 source IP (network byte order)
+ * value = struct ip_stats (per-cpu counters)
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __type(key, __u32);
+    __type(value, struct ip_stats);
+    __uint(max_entries, 65536);
+} stats_map SEC(".maps");
+
+/*
+ * config_map — Global firewall configuration flags.
+ *
+ * key 0 = global_enable (1 = firewall active, 0 = pass everything)
+ * key 1 = default_policy (0 = default drop, 1 = default allow)
+ * key 2 = log_level (0=off, 1=drops, 2=all)
+ *
+ * Using BPF_MAP_TYPE_ARRAY here because array maps have O(1) access
+ * with no hashing overhead, perfect for a small fixed config set.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(max_entries, 16);
+} config_map SEC(".maps");
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * HELPER MACROS
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+
+/*
+ * BOUNDS_CHECK — The BPF verifier requires that EVERY pointer dereference
+ * be proven safe. We cannot do `eth->h_proto` without first proving that
+ * (char*)eth + sizeof(*eth) <= data_end.
+ *
+ * This macro performs that check. If it fails, we return XDP_PASS
+ * (let the kernel handle malformed packets; don't silently drop them).
+ */
+#define BOUNDS_CHECK(ptr, end) \
+    if ((void *)(ptr) > (void *)(end)) return XDP_PASS
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * STATS UPDATE HELPER
+ *
+ * Updates per-IP stats. Separated into a helper to keep the main function
+ * readable and within the verifier's complexity limit.
+ *
+ * __always_inline: the BPF verifier handles inlined functions better than
+ * actual function calls (which require stack frame management in BPF).
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+static __always_inline void update_stats(__u32 src_ip, __u32 pkt_len, int dropped)
+{
+    struct ip_stats *stats;
+    struct ip_stats new_stats = {};   /* zero-initialize — required by verifier */
+
+    /* bpf_map_lookup_elem: returns a pointer into the map value, or NULL.
+     * The pointer is valid for the duration of this XDP call.
+     * We MUST check for NULL — the verifier enforces this. */
+    stats = bpf_map_lookup_elem(&stats_map, &src_ip);
+    if (!stats) {
+        /* First packet from this IP — insert a new entry */
+        if (dropped) {
+            new_stats.packets_dropped = 1;
+            new_stats.bytes_dropped   = pkt_len;
+        } else {
+            new_stats.packets_passed = 1;
+            new_stats.bytes_passed   = pkt_len;
+        }
+        /* bpf_map_update_elem with BPF_NOEXIST: insert only if key absent.
+         * We use BPF_ANY here to handle the race where another CPU inserted
+         * between our lookup and this update. */
+        bpf_map_update_elem(&stats_map, &src_ip, &new_stats, BPF_ANY);
+        return;
+    }
+
+    /* Atomic increment: __sync_fetch_and_add is the BPF-safe way to do
+     * atomic adds on map values. Essential for PERCPU_HASH maps. */
+    if (dropped) {
+        __sync_fetch_and_add(&stats->packets_dropped, 1);
+        __sync_fetch_and_add(&stats->bytes_dropped, pkt_len);
+    } else {
+        __sync_fetch_and_add(&stats->packets_passed, 1);
+        __sync_fetch_and_add(&stats->bytes_passed, pkt_len);
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * MAIN XDP FUNCTION
+ *
+ * SEC("xdp") tells libbpf this is an XDP program.
+ * The function receives an xdp_md context containing:
+ *   ctx->data      = pointer to start of packet (Ethernet header)
+ *   ctx->data_end  = pointer to one byte past the end of packet
+ *   ctx->ingress_ifindex = interface index the packet arrived on
+ * ─────────────────────────────────────────────────────────────────────────
+ */
+SEC("xdp")
+int firewall_main(struct xdp_md *ctx)
+{
+    /* Cast data pointers to void* for arithmetic.
+     * The verifier tracks these as "packet data" pointers with special rules. */
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+
+    /* ── Check global enable flag ─────────────────────────────────────── */
+    __u32 config_key = 0;    /* key 0 = global_enable */
+    __u32 *enabled = bpf_map_lookup_elem(&config_map, &config_key);
+    /* If config map lookup fails or firewall disabled, pass everything */
+    if (!enabled || *enabled == 0)
+        return XDP_PASS;
+
+    /* ── Parse Ethernet header ───────────────────────────────────────── */
+    struct ethhdr *eth = data;
+
+    /* BOUNDS_CHECK: prove to verifier that the full ethhdr is within packet */
+    BOUNDS_CHECK(eth + 1, data_end);
+
+    /* bpf_ntohs: converts 16-bit network byte order to host byte order.
+     * ETH_P_IP = 0x0800: IPv4 Ethernet type.
+     * Non-IPv4 packets (ARP, IPv6, etc.) are passed without inspection. */
+    if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
+        return XDP_PASS;
+
+    /* ── Parse IPv4 header ───────────────────────────────────────────── */
+    /* eth + 1 advances past the Ethernet header (14 bytes) to the IP header */
+    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    BOUNDS_CHECK(ip + 1, data_end);
+
+    /* Extract source IP (already in network byte order — we store it as-is
+     * in maps because the LPM key also uses network byte order) */
+    __u32 src_ip  = ip->saddr;
+    __u32 pkt_len = bpf_ntohs(ip->tot_len);  /* total IP packet length */
+    __u8  proto   = ip->protocol;
+
+    /* ── Check IP blocklist (LPM Trie lookup) ────────────────────────── */
+    struct lpm_key key = {
+        .prefixlen = 32,   /* exact match: treat src IP as a /32 host route */
+        .addr      = src_ip,
+    };
+
+    /* bpf_map_lookup_elem on an LPM trie does prefix matching automatically.
+     * A /32 key will match /32, /24, /16 entries in order of longest match.
+     * Returns non-NULL if ANY prefix in the trie covers this source IP. */
+    if (bpf_map_lookup_elem(&blocklist_ipv4, &key)) {
+        update_stats(src_ip, pkt_len, 1 /* dropped */);
+        return XDP_DROP;    /* silently drop — blocked IP */
+    }
+
+    /* ── Parse transport header (TCP or UDP) ─────────────────────────── */
+    /* ihl = IP header length in 32-bit words; multiply by 4 for bytes.
+     * Standard IPv4 header is 20 bytes (ihl=5), but options can extend it. */
+    __u16 dest_port = 0;
+
+    if (proto == IPPROTO_TCP) {
+        /* Advance past IP header using ihl field */
+        struct tcphdr *tcp = (struct tcphdr *)((char *)ip + (ip->ihl * 4));
+        BOUNDS_CHECK(tcp + 1, data_end);
+        dest_port = bpf_ntohs(tcp->dest);
+
+    } else if (proto == IPPROTO_UDP) {
+        struct udphdr *udp = (struct udphdr *)((char *)ip + (ip->ihl * 4));
+        BOUNDS_CHECK(udp + 1, data_end);
+        dest_port = bpf_ntohs(udp->dest);
+
+    } else if (proto == IPPROTO_ICMP) {
+        /* ICMP has no ports — check if ICMP is globally allowed */
+        __u16 icmp_key = 0;   /* use port 0 as a sentinel for ICMP */
+        struct port_rule *icmp_rule = bpf_map_lookup_elem(&allow_ports, &icmp_key);
+        if (!icmp_rule || icmp_rule->action == ACTION_DROP) {
+            update_stats(src_ip, pkt_len, 1);
+            return XDP_DROP;
+        }
+        update_stats(src_ip, pkt_len, 0);
+        return XDP_PASS;
+    } else {
+        /* Unknown protocol — check default policy */
+        __u32 policy_key = 1;
+        __u32 *default_policy = bpf_map_lookup_elem(&config_map, &policy_key);
+        if (!default_policy || *default_policy == 0) {
+            /* Default deny */
+            update_stats(src_ip, pkt_len, 1);
+            return XDP_DROP;
+        }
+        update_stats(src_ip, pkt_len, 0);
+        return XDP_PASS;
+    }
+
+    /* ── Check port allowlist ─────────────────────────────────────────── */
+    /* Convert dest_port back to network byte order for map lookup.
+     * We store ports in network byte order in the map (matches what
+     * comes off the wire) to avoid conversion overhead at the hot path. */
+    __u16 port_key = bpf_htons(dest_port);
+    struct port_rule *rule = bpf_map_lookup_elem(&allow_ports, &port_key);
+
+    if (!rule) {
+        /* Port not in allowlist — default deny */
+        update_stats(src_ip, pkt_len, 1);
+        return XDP_DROP;
+    }
+
+    /* Check if the rule's protocol matches (or is ANY) */
+    if (rule->protocol != PROTO_ANY && rule->protocol != proto) {
+        /* Protocol mismatch — e.g., rule says TCP but packet is UDP */
+        update_stats(src_ip, pkt_len, 1);
+        return XDP_DROP;
+    }
+
+    if (rule->action == ACTION_DROP) {
+        update_stats(src_ip, pkt_len, 1);
+        return XDP_DROP;
+    }
+
+    /* ── Packet passed all checks ─────────────────────────────────────── */
+    update_stats(src_ip, pkt_len, 0);
+    return XDP_PASS;
+}
+
+/*
+ * License declaration — MANDATORY for BPF programs.
+ * The kernel refuses to load GPL-restricted helpers (like bpf_trace_printk)
+ * without this. Most production XDP programs use "GPL".
+ */
+char LICENSE[] SEC("license") = "GPL";
+```
+
+### `kernel/Makefile`
+
+```makefile
+# Makefile — compiles C to eBPF object file using Clang's BPF target
+
+# Generate vmlinux.h from the running kernel's BTF data.
+# BTF (BPF Type Format) is debug info embedded in the kernel that lets
+# BPF programs access kernel structs portably across kernel versions.
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+# Compile the XDP program to BPF bytecode.
+#
+# Flags explained:
+#   -O2              : Optimization required — the BPF verifier is stricter
+#                      on unoptimized code (dead stores, redundant checks)
+#   -g               : Include BTF debug info in the output object
+#   -target bpf      : Emit BPF bytecode instead of x86 machine code
+#   -D__TARGET_ARCH_x86 : Tells vmlinux.h which arch we're targeting
+#   -I/usr/include/x86_64-linux-gnu : system headers for __u32 etc.
+#   -Wall -Wno-unused-value : warn about issues but suppress noisy ones
+firewall.o: vmlinux.h firewall.c firewall.h
+	clang -O2 -g \
+		-target bpf \
+		-D__TARGET_ARCH_x86 \
+		-I/usr/include/x86_64-linux-gnu \
+		-I. \
+		-Wall -Wno-unused-value \
+		-c firewall.c \
+		-o firewall.o
+
+clean:
+	rm -f firewall.o vmlinux.h
+
+.PHONY: clean
+```
+
+---
+
+## 6. Rust — Aya Control Plane
+
+Aya is a Rust library for eBPF that handles loading programs, managing maps, and attaching hooks — all without depending on `libbpf` (it speaks to the kernel directly via `bpf()` syscalls). This is the layer that bridges kernel and management.
+
+### `control-plane/Cargo.toml`
+
+```toml
+[package]
+name    = "ebpf-control-plane"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ebpf-control"
+path = "src/main.rs"
+
+[dependencies]
+# aya: main eBPF library — loads programs, manages maps, attaches XDP hooks
+aya = { version = "0.12", features = ["async_tokio"] }
+
+# aya-log: structured logging from BPF programs (reads bpf_trace_printk ring buffer)
+aya-log = "0.2"
+
+# tokio: async runtime — we use it for the Unix socket listener
+tokio = { version = "1", features = ["full"] }
+
+# serde/serde_json: serialize map entries to JSON for the Go management layer
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+
+# anyhow: ergonomic error handling without boilerplate
+anyhow = "1"
+
+# log + env_logger: standard logging facade
+log        = "0.4"
+env_logger = "0.11"
+
+# network-types: provides Rust types for Ethernet/IP/TCP headers
+# matches the C structs we parse in the kernel program
+network-types = "0.0.6"
+```
+
+### `control-plane/src/maps.rs`
+
+```rust
+// maps.rs
+//
+// BPF map access layer.
+// This module wraps the raw Aya map types into ergonomic Rust functions
+// that the rest of the control plane uses to read/write firewall rules.
+//
+// Key design decisions:
+//  - All IP addresses are stored in HOST byte order (u32) here in Rust.
+//    We convert to network byte order only when writing to the BPF map,
+//    matching what the C XDP program reads off the wire.
+//  - All map operations return anyhow::Result for clean error propagation.
+
+use anyhow::{Context, Result};
+use aya::maps::{HashMap, LpmTrie, PerCpuHashMap, Array};
+use aya::maps::lpm_trie::Key;
+use aya::Ebpf;
+use serde::{Deserialize, Serialize};
+use std::net::Ipv4Addr;
+
+// ─────────────────────────────────────────────────────────────────────────
+// Mirror of the C structs from firewall.h.
+// Must match byte-for-byte. `#[repr(C)]` disables Rust's reordering.
+// `Pod` (Plain Old Data) trait from aya means the type can be safely
+// read/written as raw bytes in BPF maps.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Mirrors `struct port_rule` in firewall.h
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PortRule {
+    pub action:   u8,   // 0 = drop, 1 = allow
+    pub protocol: u8,   // 0 = any, 6 = TCP, 17 = UDP
+    pub pad:      u16,  // explicit padding — must match C layout
+}
+
+/// Mirrors `struct ip_stats` in firewall.h
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct IpStats {
+    pub packets_dropped: u64,
+    pub packets_passed:  u64,
+    pub bytes_dropped:   u64,
+    pub bytes_passed:    u64,
+}
+
+// Safety: PortRule contains only integers and explicit padding.
+// It has no pointers, no references, no interior mutability.
+// Implementing Pod lets Aya read/write it directly as map bytes.
+unsafe impl aya::Pod for PortRule {}
+unsafe impl aya::Pod for IpStats {}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BLOCKLIST OPERATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Block a CIDR range (e.g., "192.168.1.0/24").
+///
+/// The LpmTrie key format: [prefix_len (4 bytes LE), addr (4 bytes BE)]
+/// We use Aya's `Key` wrapper which handles this layout correctly.
+///
+/// # Arguments
+/// * `bpf`    - The loaded eBPF program handle
+/// * `ip`     - Base address of the CIDR (e.g., 192.168.1.0)
+/// * `prefix` - Prefix length 0–32 (e.g., 24 for /24)
+pub fn block_cidr(bpf: &mut Ebpf, ip: Ipv4Addr, prefix: u32) -> Result<()> {
+    // Get a mutable reference to the LPM trie map.
+    // "blocklist_ipv4" must match the map name in the C SEC(".maps") definition.
+    let mut map: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(
+        bpf.map_mut("blocklist_ipv4")
+            .context("map 'blocklist_ipv4' not found — did the BPF program load correctly?")?
+    )?;
+
+    // Convert IP to network byte order bytes (big-endian).
+    // Ipv4Addr::octets() returns bytes in network order already.
+    let addr_bytes = ip.octets();
+
+    // Aya's Key<T> wraps the (prefix_len, data) pair.
+    // Internally it lays them out as the kernel's struct bpf_lpm_trie_key expects.
+    let key = Key::new(prefix, addr_bytes);
+
+    // Value is just a sentinel byte — we only care if the key EXISTS in the trie.
+    map.insert(&key, 1u8, 0)
+        .context(format!("failed to insert {}/{} into blocklist", ip, prefix))?;
+
+    log::info!("Blocked CIDR: {}/{}", ip, prefix);
+    Ok(())
+}
+
+/// Remove a previously blocked CIDR range.
+pub fn unblock_cidr(bpf: &mut Ebpf, ip: Ipv4Addr, prefix: u32) -> Result<()> {
+    let mut map: LpmTrie<_, [u8; 4], u8> = LpmTrie::try_from(
+        bpf.map_mut("blocklist_ipv4")
+            .context("map 'blocklist_ipv4' not found")?
+    )?;
+
+    let key = Key::new(prefix, ip.octets());
+    map.remove(&key)
+        .context(format!("failed to remove {}/{} from blocklist", ip, prefix))?;
+
+    log::info!("Unblocked CIDR: {}/{}", ip, prefix);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// PORT RULE OPERATIONS
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Add or update a port rule.
+///
+/// # Arguments
+/// * `port`     - Port number in host byte order (e.g., 22, 80, 443)
+/// * `protocol` - 0 = any, 6 = TCP, 17 = UDP
+/// * `allow`    - true = allow, false = explicitly deny
+///
+/// Note: The XDP program stores port keys in NETWORK byte order.
+/// We call u16::to_be() here to convert 22 → 0x1600 before inserting.
+pub fn set_port_rule(
+    bpf: &mut Ebpf,
+    port: u16,
+    protocol: u8,
+    allow: bool,
+) -> Result<()> {
+    let mut map: HashMap<_, u16, PortRule> = HashMap::try_from(
+        bpf.map_mut("allow_ports")
+            .context("map 'allow_ports' not found")?
+    )?;
+
+    let rule = PortRule {
+        action:   if allow { 1 } else { 0 },
+        protocol,
+        pad: 0,
+    };
+
+    // Store in network byte order — matches XDP program's bpf_htons(dest_port)
+    map.insert(port.to_be(), rule, 0)
+        .context(format!("failed to insert port rule for port {}", port))?;
+
+    log::info!(
+        "Port rule: {} {} {}",
+        port,
+        if protocol == 6 { "TCP" } else if protocol == 17 { "UDP" } else { "ANY" },
+        if allow { "ALLOW" } else { "DENY" }
+    );
+    Ok(())
+}
+
+/// Remove a port rule (the port will fall back to default-deny).
+pub fn remove_port_rule(bpf: &mut Ebpf, port: u16) -> Result<()> {
+    let mut map: HashMap<_, u16, PortRule> = HashMap::try_from(
+        bpf.map_mut("allow_ports")
+            .context("map 'allow_ports' not found")?
+    )?;
+
+    map.remove(&port.to_be())
+        .context(format!("failed to remove port rule for port {}", port))?;
+
+    log::info!("Removed port rule for port {}", port);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// STATISTICS READING
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Read per-IP statistics from the PERCPU hash map.
+///
+/// PERCPU maps store one value per CPU to avoid lock contention.
+/// Aya returns a Vec<IpStats> where index = CPU id.
+/// We sum across all CPUs to get global totals.
+///
+/// Returns a Vec of (ip_string, aggregated_stats) sorted by packets_dropped desc.
+pub fn read_stats(bpf: &mut Ebpf) -> Result<Vec<(String, IpStats)>> {
+    let map: PerCpuHashMap<_, u32, IpStats> = PerCpuHashMap::try_from(
+        bpf.map("stats_map")
+            .context("map 'stats_map' not found")?
+    )?;
+
+    let mut results = Vec::new();
+
+    // Iterate over all keys in the map.
+    // For PERCPU maps, iter() returns (key, PerCpuValues<V>).
+    // PerCpuValues<V> dereferences to a slice indexed by CPU id.
+    for item in map.iter() {
+        let (raw_ip, per_cpu_stats) = item?;
+
+        // Sum across all CPUs
+        let mut total = IpStats::default();
+        for cpu_stats in per_cpu_stats.iter() {
+            total.packets_dropped += cpu_stats.packets_dropped;
+            total.packets_passed  += cpu_stats.packets_passed;
+            total.bytes_dropped   += cpu_stats.bytes_dropped;
+            total.bytes_passed    += cpu_stats.bytes_passed;
+        }
+
+        // raw_ip is stored in network byte order — convert to display string
+        let ip = Ipv4Addr::from(u32::from_be(raw_ip));
+        results.push((ip.to_string(), total));
+    }
+
+    // Sort by most dropped first — useful for identifying top attackers
+    results.sort_by(|a, b| b.1.packets_dropped.cmp(&a.1.packets_dropped));
+    Ok(results)
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CONFIGURATION
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Set a configuration value in the config_map array.
+/// key 0 = global_enable, key 1 = default_policy, key 2 = log_level
+pub fn set_config(bpf: &mut Ebpf, key: u32, value: u32) -> Result<()> {
+    let mut map: Array<_, u32> = Array::try_from(
+        bpf.map_mut("config_map")
+            .context("map 'config_map' not found")?
+    )?;
+
+    map.set(key, value, 0)
+        .context(format!("failed to set config key {} = {}", key, value))?;
+
+    Ok(())
+}
+```
+
+### `control-plane/src/main.rs`
+
+```rust
+// main.rs
+//
+// Entry point for the Rust control plane.
+//
+// Responsibilities:
+//   1. Load the compiled XDP BPF object (firewall.o) into the kernel
+//   2. Attach it to the network interface in NATIVE XDP mode
+//   3. Initialize default firewall rules (allow SSH port 22)
+//   4. Enable the firewall via config_map
+//   5. Listen on a Unix domain socket for commands from the Go management layer
+//   6. Gracefully detach XDP on Ctrl-C
+
+use anyhow::{Context, Result};
+use aya::{
+    programs::{Xdp, XdpFlags},
+    Ebpf,
+};
+use aya_log::EbpfLogger;
+use log::{info, warn};
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::signal;
+
+mod maps;
+use maps::{block_cidr, read_stats, remove_port_rule, set_config, set_port_rule, unblock_cidr};
+
+// Control commands sent over the Unix socket from Go management layer.
+// Simple line-based protocol: one JSON command per line.
+// Using an enum makes exhaustive matching mandatory — no forgotten cases.
+#[derive(serde::Deserialize, Debug)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+enum Command {
+    BlockCidr   { ip: String, prefix: u32 },
+    UnblockCidr { ip: String, prefix: u32 },
+    AllowPort   { port: u16, protocol: u8 },
+    DenyPort    { port: u16 },
+    RemovePort  { port: u16 },
+    GetStats,
+    Enable,
+    Disable,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize env_logger. Set RUST_LOG=info or RUST_LOG=debug.
+    env_logger::init();
+
+    // ── Command-line args ─────────────────────────────────────────────
+    let iface = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "eth1".to_string());
+    let bpf_obj = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "../kernel/firewall.o".to_string());
+
+    info!("Loading XDP program from {} onto interface {}", bpf_obj, iface);
+
+    // ── Load the compiled BPF object file ─────────────────────────────
+    // Aya reads the ELF file, finds all SEC(".maps") and SEC("xdp")
+    // sections, and prepares them for kernel loading.
+    let mut bpf = Ebpf::load_file(&bpf_obj)
+        .context("failed to load BPF object — did you compile firewall.c?")?;
+
+    // Set up aya-log to forward bpf_printk() output from the kernel
+    // program to our env_logger. Useful for debugging.
+    if let Err(e) = EbpfLogger::init(&mut bpf) {
+        warn!("Failed to init eBPF logger (non-fatal): {}", e);
+    }
+
+    // ── Get the XDP program and attach it ─────────────────────────────
+    // "firewall_main" must match the C function name exactly.
+    let program: &mut Xdp = bpf
+        .program_mut("firewall_main")
+        .context("XDP program 'firewall_main' not found in BPF object")?
+        .try_into()?;
+
+    // Load the program into the kernel. This runs the verifier.
+    // If the verifier rejects the program, this returns an error
+    // with the verifier log explaining exactly what went wrong.
+    program.load().context("kernel verifier rejected the XDP program")?;
+
+    // Attach in NATIVE mode (XdpFlags::default() = SKB_MODE fallback,
+    // XdpFlags::DRV_MODE = native only, error if not supported).
+    // We try native first, fall back to SKB mode if the driver doesn't support it.
+    let attach_result = program.attach(&iface, XdpFlags::DRV_MODE);
+    let _link_id = match attach_result {
+        Ok(id) => {
+            info!("XDP attached in NATIVE mode on {}", iface);
+            id
+        }
+        Err(e) => {
+            warn!("Native XDP failed ({}), falling back to SKB mode", e);
+            program
+                .attach(&iface, XdpFlags::SKB_MODE)
+                .context("XDP attachment failed in both native and SKB modes")?
+        }
+    };
+
+    // ── Initialize default rules ──────────────────────────────────────
+    // Allow SSH (port 22, TCP) — CRITICAL: do this before enabling the
+    // firewall or you'll lock yourself out.
+    set_port_rule(&mut bpf, 22, 6 /* TCP */, true)
+        .context("failed to allow SSH port 22")?;
+
+    // Allow established connections on common ports
+    set_port_rule(&mut bpf, 80,  6, true)?;   // HTTP
+    set_port_rule(&mut bpf, 443, 6, true)?;   // HTTPS
+    set_port_rule(&mut bpf, 53,  17, true)?;  // DNS over UDP
+
+    // Allow ICMP (ping) — uses port 0 as sentinel in our map
+    set_port_rule(&mut bpf, 0, 1 /* ICMP */, true)?;
+
+    // Enable the firewall (config key 0 = global_enable)
+    set_config(&mut bpf, 0, 1)?;
+
+    info!("Firewall active. Default-deny with SSH/HTTP/HTTPS/DNS allowed.");
+
+    // ── Wrap bpf in Arc<Mutex> for sharing across async tasks ─────────
+    // The Unix socket listener runs in a separate async task and needs
+    // mutable access to bpf to update maps.
+    let bpf = Arc::new(Mutex::new(bpf));
+
+    // ── Unix socket listener ──────────────────────────────────────────
+    // The Go management layer sends JSON commands over this socket.
+    // We use a Unix socket (not TCP) for performance and to avoid
+    // the socket being accessible from the network.
+    let socket_path = "/var/run/ebpf-firewall.sock";
+    let _ = std::fs::remove_file(socket_path); // Clean up leftover socket
+    let listener = UnixListener::bind(socket_path)
+        .context("failed to bind Unix socket")?;
+
+    let bpf_clone = Arc::clone(&bpf);
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let bpf_ref = Arc::clone(&bpf_clone);
+                    // Handle each connection in its own task
+                    tokio::spawn(handle_connection(stream, bpf_ref));
+                }
+                Err(e) => {
+                    warn!("Unix socket accept error: {}", e);
+                }
+            }
+        }
+    });
+
+    info!("Control socket listening at {}", socket_path);
+    info!("Send Ctrl-C to detach XDP and exit.");
+
+    // ── Wait for Ctrl-C ───────────────────────────────────────────────
+    // When this task exits, `_link_id` is dropped, which automatically
+    // detaches the XDP program from the interface. This is Aya's RAII
+    // (Resource Acquisition Is Initialization) cleanup model.
+    signal::ctrl_c().await?;
+    info!("Shutting down — XDP program will be detached.");
+
+    Ok(())
+}
+
+/// Handle a single management connection.
+/// Reads JSON commands line by line, executes them, sends JSON responses.
+async fn handle_connection(
+    stream: tokio::net::UnixStream,
+    bpf: Arc<Mutex<Ebpf>>,
+) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        // Parse the incoming JSON command
+        let response = match serde_json::from_str::<Command>(&line) {
+            Err(e) => {
+                format!("{{\"error\": \"parse error: {}\"}}\n", e)
+            }
+            Ok(cmd) => {
+                // Acquire lock and process command
+                let mut bpf_guard = bpf.lock().unwrap();
+                execute_command(&mut bpf_guard, cmd)
+            }
+        };
+
+        if writer.write_all(response.as_bytes()).await.is_err() {
+            break;  // Client disconnected
+        }
+    }
+}
+
+/// Execute a parsed command against the BPF maps.
+/// Returns a JSON string response.
+fn execute_command(bpf: &mut Ebpf, cmd: Command) -> String {
+    let result: Result<String> = match cmd {
+        Command::BlockCidr { ip, prefix } => {
+            let addr: Ipv4Addr = ip.parse()?;
+            block_cidr(bpf, addr, prefix)?;
+            Ok(format!("{{\"ok\": \"blocked {}/{}\"}}\n", ip, prefix))
+        }
+        Command::UnblockCidr { ip, prefix } => {
+            let addr: Ipv4Addr = ip.parse()?;
+            unblock_cidr(bpf, addr, prefix)?;
+            Ok(format!("{{\"ok\": \"unblocked {}/{}\"}}\n", ip, prefix))
+        }
+        Command::AllowPort { port, protocol } => {
+            set_port_rule(bpf, port, protocol, true)?;
+            Ok(format!("{{\"ok\": \"allowed port {}\"}}\n", port))
+        }
+        Command::DenyPort { port } => {
+            set_port_rule(bpf, port, 0, false)?;
+            Ok(format!("{{\"ok\": \"denied port {}\"}}\n", port))
+        }
+        Command::RemovePort { port } => {
+            remove_port_rule(bpf, port)?;
+            Ok(format!("{{\"ok\": \"removed rule for port {}\"}}\n", port))
+        }
+        Command::GetStats => {
+            let stats = read_stats(bpf)?;
+            Ok(serde_json::to_string(&stats)? + "\n")
+        }
+        Command::Enable => {
+            set_config(bpf, 0, 1)?;
+            Ok("{\"ok\": \"firewall enabled\"}\n".to_string())
+        }
+        Command::Disable => {
+            set_config(bpf, 0, 0)?;
+            Ok("{\"ok\": \"firewall disabled\"}\n".to_string())
+        }
+    };
+
+    result.unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}\n", e))
+}
+```
+
+---
+
+## 7. Go — Management API & CLI
+
+The Go layer provides a human-friendly REST API and a `firewall` CLI command. It talks to the Rust control plane via the Unix socket — Go never touches BPF maps directly, which keeps the BPF state management in one place (Rust).
+
+### `management/bpfmaps/client.go`
+
+```go
+// bpfmaps/client.go
+//
+// Unix socket client that sends JSON commands to the Rust control plane.
+//
+// We use a simple line-delimited JSON protocol:
+//   - Client sends one JSON line per command
+//   - Server replies with one JSON line per response
+//
+// This is not HTTP — using a raw Unix socket avoids HTTP overhead for
+// what are ultimately very fast BPF map operations.
+
+package bpfmaps
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+	"time"
+)
+
+const socketPath = "/var/run/ebpf-firewall.sock"
+
+// IpStats mirrors the Rust IpStats struct.
+// json tags must match the serde field names in Rust.
+type IpStats struct {
+	PacketsDropped uint64 `json:"packets_dropped"`
+	PacketsPassed  uint64 `json:"packets_passed"`
+	BytesDropped   uint64 `json:"bytes_dropped"`
+	BytesPassed    uint64 `json:"bytes_passed"`
+}
+
+// StatEntry is one element from the GetStats response.
+// The Rust side returns []("ip_string", IpStats) tuples as JSON arrays.
+type StatEntry struct {
+	IP    string  `json:"ip"`
+	Stats IpStats `json:"stats"`
+}
+
+// Client holds the Unix socket connection to the Rust control plane.
+// We keep a persistent connection rather than reconnecting per command
+// to avoid socket setup overhead in the hot path.
+type Client struct {
+	conn   net.Conn
+	reader *bufio.Reader
+}
+
+// NewClient dials the Rust control plane's Unix socket.
+// Retries up to 3 times with 500ms delay — the control plane may be
+// starting up when the management layer first connects.
+func NewClient() (*Client, error) {
+	var conn net.Conn
+	var err error
+
+	for i := 0; i < 3; i++ {
+		// net.Dial("unix", path) opens a Unix domain socket connection.
+		// This is local IPC — no network stack involved.
+		conn, err = net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to control plane at %s: %w", socketPath, err)
+	}
+
+	return &Client{
+		conn:   conn,
+		reader: bufio.NewReader(conn),
+	}, nil
+}
+
+// Close cleans up the connection.
+func (c *Client) Close() error {
+	return c.conn.Close()
+}
+
+// send sends a command as a JSON line and reads back one JSON line response.
+// The command parameter is any struct with json tags; it is marshaled inline.
+func (c *Client) send(cmd map[string]interface{}) (string, error) {
+	// Marshal the command to a single JSON line
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return "", fmt.Errorf("marshal error: %w", err)
+	}
+
+	// Write command + newline (the Rust server reads line by line)
+	c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(c.conn, "%s\n", data); err != nil {
+		return "", fmt.Errorf("write error: %w", err)
+	}
+
+	// Read exactly one line of response
+	c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	line, err := c.reader.ReadString('\n')
+	if err != nil {
+		return "", fmt.Errorf("read error: %w", err)
+	}
+
+	return strings.TrimSpace(line), nil
+}
+
+// BlockCIDR blocks a CIDR range. ip should be "192.168.1.0", prefix = 24.
+func (c *Client) BlockCIDR(ip string, prefix uint32) error {
+	resp, err := c.send(map[string]interface{}{
+		"cmd":    "block_cidr",
+		"ip":     ip,
+		"prefix": prefix,
+	})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// UnblockCIDR removes a blocked CIDR range.
+func (c *Client) UnblockCIDR(ip string, prefix uint32) error {
+	resp, err := c.send(map[string]interface{}{
+		"cmd":    "unblock_cidr",
+		"ip":     ip,
+		"prefix": prefix,
+	})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// AllowPort adds a port to the allowlist.
+// protocol: 0 = any, 6 = TCP, 17 = UDP
+func (c *Client) AllowPort(port uint16, protocol uint8) error {
+	resp, err := c.send(map[string]interface{}{
+		"cmd":      "allow_port",
+		"port":     port,
+		"protocol": protocol,
+	})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// DenyPort explicitly denies a port (overrides allowlist entry).
+func (c *Client) DenyPort(port uint16) error {
+	resp, err := c.send(map[string]interface{}{
+		"cmd":  "deny_port",
+		"port": port,
+	})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// GetStats returns per-IP packet statistics from the kernel.
+func (c *Client) GetStats() ([]StatEntry, error) {
+	// The Rust side serializes []("ip", stats) as a JSON array of 2-element arrays.
+	resp, err := c.send(map[string]interface{}{"cmd": "get_stats"})
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse the response: [ ["192.168.1.1", {stats}], ... ]
+	var raw [][]json.RawMessage
+	if err := json.Unmarshal([]byte(resp), &raw); err != nil {
+		return nil, fmt.Errorf("stats parse error: %w\nraw: %s", err, resp)
+	}
+
+	var entries []StatEntry
+	for _, pair := range raw {
+		if len(pair) != 2 {
+			continue
+		}
+		var ip string
+		var stats IpStats
+		if err := json.Unmarshal(pair[0], &ip); err != nil {
+			continue
+		}
+		if err := json.Unmarshal(pair[1], &stats); err != nil {
+			continue
+		}
+		entries = append(entries, StatEntry{IP: ip, Stats: stats})
+	}
+
+	return entries, nil
+}
+
+// Enable activates the firewall.
+func (c *Client) Enable() error {
+	resp, err := c.send(map[string]interface{}{"cmd": "enable"})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// Disable deactivates the firewall (pass all traffic).
+func (c *Client) Disable() error {
+	resp, err := c.send(map[string]interface{}{"cmd": "disable"})
+	if err != nil {
+		return err
+	}
+	return checkResponse(resp)
+}
+
+// checkResponse inspects a JSON response line for error fields.
+func checkResponse(resp string) error {
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(resp), &result); err != nil {
+		return fmt.Errorf("invalid response: %s", resp)
+	}
+	if errMsg, ok := result["error"]; ok {
+		return fmt.Errorf("control plane error: %v", errMsg)
+	}
+	return nil
+}
+```
+
+### `management/api/handlers.go`
+
+```go
+// api/handlers.go
+//
+// HTTP REST API handlers.
+//
+// Routes:
+//   POST /api/block          { "ip": "1.2.3.0", "prefix": 24 }
+//   DELETE /api/block        { "ip": "1.2.3.0", "prefix": 24 }
+//   POST /api/port/allow     { "port": 443, "protocol": "tcp" }
+//   POST /api/port/deny      { "port": 8080 }
+//   GET  /api/stats          → JSON array of IP stats
+//   POST /api/enable
+//   POST /api/disable
+//   GET  /api/health         → 200 OK
+
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+
+	"ebpf-management/bpfmaps"
+)
+
+// Handler holds dependencies for the HTTP handlers.
+// Using a struct keeps handlers testable — we can inject a mock client.
+type Handler struct {
+	bpf *bpfmaps.Client
+}
+
+// NewHandler creates a Handler with a connected BPF client.
+func NewHandler(bpf *bpfmaps.Client) *Handler {
+	return &Handler{bpf: bpf}
+}
+
+// respond is a helper that writes a JSON response with the given status code.
+// It always sets Content-Type: application/json and handles marshal errors.
+func respond(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		http.Error(w, `{"error":"response encoding failed"}`, 500)
+	}
+}
+
+// decodeBody decodes a JSON request body into dst.
+// Returns false and writes an error response if decoding fails.
+func decodeBody(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		respond(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("invalid request body: %v", err),
+		})
+		return false
+	}
+	return true
+}
+
+// BlockHandler handles POST and DELETE /api/block
+func (h *Handler) BlockHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IP     string `json:"ip"`
+		Prefix uint32 `json:"prefix"`
+	}
+
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.IP == "" || req.Prefix > 32 {
+		respond(w, http.StatusBadRequest, map[string]string{
+			"error": "ip and prefix (0-32) are required",
+		})
+		return
+	}
+
+	var err error
+	if r.Method == http.MethodPost {
+		// POST = block the CIDR
+		err = h.bpf.BlockCIDR(req.IP, req.Prefix)
+	} else {
+		// DELETE = unblock the CIDR
+		err = h.bpf.UnblockCIDR(req.IP, req.Prefix)
+	}
+
+	if err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	action := "blocked"
+	if r.Method == http.MethodDelete {
+		action = "unblocked"
+	}
+	respond(w, http.StatusOK, map[string]string{
+		"ok": fmt.Sprintf("%s %s/%d", action, req.IP, req.Prefix),
+	})
+}
+
+// AllowPortHandler handles POST /api/port/allow
+// Expects: { "port": 443, "protocol": "tcp" }
+// protocol can be "tcp", "udp", or "any" (default)
+func (h *Handler) AllowPortHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Port     uint16 `json:"port"`
+		Protocol string `json:"protocol"`
+	}
+
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if req.Port == 0 {
+		respond(w, http.StatusBadRequest, map[string]string{"error": "port is required"})
+		return
+	}
+
+	// Map protocol string to the numeric value expected by the kernel
+	var protoNum uint8
+	switch req.Protocol {
+	case "tcp":
+		protoNum = 6
+	case "udp":
+		protoNum = 17
+	case "icmp":
+		protoNum = 1
+	default:
+		protoNum = 0  // "any" — matches all protocols
+	}
+
+	if err := h.bpf.AllowPort(req.Port, protoNum); err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	respond(w, http.StatusOK, map[string]string{
+		"ok": fmt.Sprintf("allowed port %d/%s", req.Port, req.Protocol),
+	})
+}
+
+// DenyPortHandler handles POST /api/port/deny
+func (h *Handler) DenyPortHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Port uint16 `json:"port"`
+	}
+
+	if !decodeBody(w, r, &req) {
+		return
+	}
+
+	if err := h.bpf.DenyPort(req.Port); err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	respond(w, http.StatusOK, map[string]string{
+		"ok": fmt.Sprintf("denied port %d", req.Port),
+	})
+}
+
+// StatsHandler handles GET /api/stats
+func (h *Handler) StatsHandler(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.bpf.GetStats()
+	if err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// If no stats yet, return empty array (not null)
+	if stats == nil {
+		stats = []bpfmaps.StatEntry{}
+	}
+
+	respond(w, http.StatusOK, stats)
+}
+
+// EnableHandler handles POST /api/enable
+func (h *Handler) EnableHandler(w http.ResponseWriter, r *http.Request) {
+	if err := h.bpf.Enable(); err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	respond(w, http.StatusOK, map[string]string{"ok": "firewall enabled"})
+}
+
+// DisableHandler handles POST /api/disable
+func (h *Handler) DisableHandler(w http.ResponseWriter, r *http.Request) {
+	if err := h.bpf.Disable(); err != nil {
+		respond(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	respond(w, http.StatusOK, map[string]string{"ok": "firewall disabled — all traffic passes"})
+}
+
+// HealthHandler handles GET /api/health
+func (h *Handler) HealthHandler(w http.ResponseWriter, r *http.Request) {
+	respond(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+```
+
+### `management/main.go`
+
+```go
+// main.go
+//
+// Management layer entry point.
+// Starts the REST API server and registers all routes.
+//
+// Usage:
+//   go run . [--addr :8080]
+//
+// The server listens on :8080 by default.
+// All API calls are forwarded to the Rust control plane via Unix socket.
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+
+	"ebpf-management/api"
+	"ebpf-management/bpfmaps"
+)
+
+func main() {
+	addr := flag.String("addr", ":8080", "HTTP listen address")
+	flag.Parse()
+
+	// If the first argument is a subcommand, run the CLI instead of the server.
+	// This lets the same binary serve both `firewall block 1.2.3.4/24`
+	// and `firewall serve` (the HTTP API mode).
+	if len(os.Args) > 1 && os.Args[1] != "serve" {
+		runCLI()
+		return
+	}
+
+	// Connect to the Rust control plane
+	bpf, err := bpfmaps.NewClient()
+	if err != nil {
+		log.Fatalf("Cannot connect to control plane: %v\n"+
+			"Is ebpf-control running? Check: ls -la /var/run/ebpf-firewall.sock", err)
+	}
+	defer bpf.Close()
+
+	// Build HTTP handler with all routes
+	handler := api.NewHandler(bpf)
+	mux := http.NewServeMux()
+
+	// Middleware: log all requests
+	logged := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("%s %s", r.Method, r.URL.Path)
+			h(w, r)
+		}
+	}
+
+	// Register routes
+	mux.HandleFunc("/api/block",      logged(handler.BlockHandler))
+	mux.HandleFunc("/api/port/allow", logged(handler.AllowPortHandler))
+	mux.HandleFunc("/api/port/deny",  logged(handler.DenyPortHandler))
+	mux.HandleFunc("/api/stats",      logged(handler.StatsHandler))
+	mux.HandleFunc("/api/enable",     logged(handler.EnableHandler))
+	mux.HandleFunc("/api/disable",    logged(handler.DisableHandler))
+	mux.HandleFunc("/api/health",     logged(handler.HealthHandler))
+
+	fmt.Printf("eBPF Firewall Management API listening on %s\n", *addr)
+	fmt.Println("Endpoints:")
+	fmt.Println("  POST   /api/block          {\"ip\":\"x.x.x.x\",\"prefix\":N}")
+	fmt.Println("  DELETE /api/block          {\"ip\":\"x.x.x.x\",\"prefix\":N}")
+	fmt.Println("  POST   /api/port/allow     {\"port\":N,\"protocol\":\"tcp|udp|any\"}")
+	fmt.Println("  POST   /api/port/deny      {\"port\":N}")
+	fmt.Println("  GET    /api/stats")
+	fmt.Println("  POST   /api/enable|disable")
+
+	log.Fatal(http.ListenAndServe(*addr, mux))
+}
+```
+
+### `management/cli/firewall.go`
+
+```go
+// cli/firewall.go
+//
+// CLI frontend — wraps the bpfmaps client with a human-friendly interface.
+//
+// Commands:
+//   firewall block   <ip/prefix>         Block a CIDR
+//   firewall unblock <ip/prefix>         Unblock a CIDR
+//   firewall allow   <port> [proto]      Allow a port
+//   firewall deny    <port>              Deny a port
+//   firewall stats                       Show per-IP statistics
+//   firewall enable / disable            Toggle firewall
+
+package cli
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"text/tabwriter"
+
+	"ebpf-management/bpfmaps"
+)
+
+// RunCLI is called by main() when a subcommand is given.
+func RunCLI(args []string) {
+	if len(args) == 0 {
+		printUsage()
+		os.Exit(1)
+	}
+
+	// Connect to control plane
+	bpf, err := bpfmaps.NewClient()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot connect to control plane: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Is 'ebpf-control eth1' running?\n")
+		os.Exit(1)
+	}
+	defer bpf.Close()
+
+	cmd := args[0]
+	rest := args[1:]
+
+	switch cmd {
+	case "block":
+		cmdBlock(bpf, rest, false)
+	case "unblock":
+		cmdBlock(bpf, rest, true)
+	case "allow":
+		cmdPort(bpf, rest, true)
+	case "deny":
+		cmdPort(bpf, rest, false)
+	case "stats":
+		cmdStats(bpf)
+	case "enable":
+		if err := bpf.Enable(); err != nil {
+			die(err)
+		}
+		fmt.Println("✓ Firewall enabled")
+	case "disable":
+		if err := bpf.Disable(); err != nil {
+			die(err)
+		}
+		fmt.Println("⚠  Firewall disabled — all traffic is passing")
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+// cmdBlock handles the block/unblock command.
+// Accepts CIDR notation: "1.2.3.0/24" or plain IP "1.2.3.4" (treated as /32)
+func cmdBlock(bpf *bpfmaps.Client, args []string, unblock bool) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: firewall block <ip[/prefix]>")
+		os.Exit(1)
+	}
+
+	// Parse CIDR or plain IP
+	cidr := args[0]
+	if !strings.Contains(cidr, "/") {
+		cidr = cidr + "/32"  // treat bare IP as /32 host route
+	}
+
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid CIDR: %s\n", cidr)
+		os.Exit(1)
+	}
+
+	// Get prefix length from the parsed network
+	ones, _ := network.Mask.Size()
+	ip := network.IP.String()
+
+	action := bpf.BlockCIDR
+	word := "Blocked"
+	if unblock {
+		action = bpf.UnblockCIDR
+		word = "Unblocked"
+	}
+
+	if err := action(ip, uint32(ones)); err != nil {
+		die(err)
+	}
+
+	fmt.Printf("✓ %s %s/%d\n", word, ip, ones)
+}
+
+// cmdPort handles the allow/deny port command.
+func cmdPort(bpf *bpfmaps.Client, args []string, allow bool) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: firewall allow <port> [tcp|udp|any]")
+		os.Exit(1)
+	}
+
+	portNum, err := strconv.ParseUint(args[0], 10, 16)
+	if err != nil || portNum == 0 || portNum > 65535 {
+		fmt.Fprintf(os.Stderr, "Invalid port: %s (must be 1-65535)\n", args[0])
+		os.Exit(1)
+	}
+
+	if !allow {
+		if err := bpf.DenyPort(uint16(portNum)); err != nil {
+			die(err)
+		}
+		fmt.Printf("✓ Denied port %d\n", portNum)
+		return
+	}
+
+	// Parse optional protocol argument
+	proto := "any"
+	if len(args) > 1 {
+		proto = strings.ToLower(args[1])
+	}
+
+	var protoNum uint8
+	switch proto {
+	case "tcp":
+		protoNum = 6
+	case "udp":
+		protoNum = 17
+	case "any", "":
+		protoNum = 0
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown protocol: %s (use tcp, udp, or any)\n", proto)
+		os.Exit(1)
+	}
+
+	if err := bpf.AllowPort(uint16(portNum), protoNum); err != nil {
+		die(err)
+	}
+	fmt.Printf("✓ Allowed port %d/%s\n", portNum, proto)
+}
+
+// cmdStats prints the per-IP statistics table.
+func cmdStats(bpf *bpfmaps.Client) {
+	stats, err := bpf.GetStats()
+	if err != nil {
+		die(err)
+	}
+
+	if len(stats) == 0 {
+		fmt.Println("No traffic statistics yet.")
+		return
+	}
+
+	// tabwriter aligns columns automatically
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SOURCE IP\tDROPPED PKTS\tPASSED PKTS\tDROPPED BYTES\tPASSED BYTES")
+	fmt.Fprintln(w, "─────────────\t────────────\t───────────\t─────────────\t────────────")
+
+	for _, e := range stats {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%s\n",
+			e.IP,
+			e.Stats.PacketsDropped,
+			e.Stats.PacketsPassed,
+			humanBytes(e.Stats.BytesDropped),
+			humanBytes(e.Stats.BytesPassed),
+		)
+	}
+	w.Flush()
+}
+
+// humanBytes formats a byte count as a human-readable string.
+func humanBytes(b uint64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1fGB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.1fKB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", b)
+	}
+}
+
+func die(err error) {
+	fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	os.Exit(1)
+}
+
+func printUsage() {
+	fmt.Println(`eBPF Firewall CLI
+
+Usage:
+  firewall block   <ip[/prefix]>        Block IP or CIDR (e.g. 1.2.3.0/24)
+  firewall unblock <ip[/prefix]>        Remove a block
+  firewall allow   <port> [tcp|udp|any] Allow inbound port
+  firewall deny    <port>               Explicitly deny a port
+  firewall stats                        Show per-IP packet statistics
+  firewall enable                       Activate firewall
+  firewall disable                      Deactivate firewall (pass-all)
+  firewall serve   [--addr :8080]       Start REST API server
+
+Examples:
+  firewall block 185.224.128.0/24       # Block a known malicious subnet
+  firewall allow 8443 tcp               # Allow HTTPS on alternate port
+  firewall stats                        # See who's being dropped
+  firewall disable                      # Emergency: pass everything
+`)
+}
+```
+
+---
+
+## 8. Build & Deploy
+
+```bash
+# ── Step 1: Compile the XDP kernel program ─────────────────────────
+cd kernel/
+make vmlinux.h       # Generate BTF header from running kernel
+make firewall.o      # Compile C to BPF bytecode
+
+# Verify the output is a valid BPF ELF object
+file firewall.o
+# Output: firewall.o: ELF 64-bit LSB relocatable, eBPF, ...
+
+# Inspect the compiled program (optional — great for debugging)
+bpftool prog show
+llvm-objdump -d firewall.o   # Disassemble BPF bytecode
+
+# ── Step 2: Build the Rust control plane ───────────────────────────
+cd ../control-plane/
+cargo build --release
+
+# The binary is at: target/release/ebpf-control
+
+# ── Step 3: Build the Go management layer ──────────────────────────
+cd ../management/
+go mod tidy
+go build -o firewall .
+
+# ── Step 4: Run everything ─────────────────────────────────────────
+
+# Terminal 1: Start the control plane (needs root for BPF syscalls)
+sudo RUST_LOG=info ./target/release/ebpf-control eth1 kernel/firewall.o
+
+# Expected output:
+# INFO Loading XDP program from kernel/firewall.o onto interface eth1
+# INFO XDP attached in NATIVE mode on eth1
+# INFO Firewall active. Default-deny with SSH/HTTP/HTTPS/DNS allowed.
+# INFO Control socket listening at /var/run/ebpf-firewall.sock
+
+# Terminal 2: Verify XDP is attached (look for "xdp" NOT "xdpgeneric")
+ip link show eth1
+# eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 3498 xdp ...
+
+# Terminal 3: Use the CLI
+sudo ./firewall block 185.224.128.0/24
+sudo ./firewall allow 9090 tcp
+sudo ./firewall stats
+
+# Or start the REST API server
+sudo ./firewall serve --addr :8080
+
+# Test the REST API
+curl -s -X POST http://localhost:8080/api/block \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"10.0.0.5","prefix":32}' | jq
+
+curl -s http://localhost:8080/api/stats | jq
+
+curl -s -X POST http://localhost:8080/api/port/allow \
+  -H "Content-Type: application/json" \
+  -d '{"port":9090,"protocol":"tcp"}' | jq
+```
+
+---
+
+## 9. Testing & Verification
+
+```bash
+# ── Verify native XDP mode (not generic) ──────────────────────────
+ip link show eth1 | grep xdp
+# Good:  "... xdp ..."           (native — inside the driver)
+# Bad:   "... xdpgeneric ..."    (generic — after SKB allocation, no speedup)
+
+# ── Test IP blocking ──────────────────────────────────────────────
+# From another machine (or using network namespaces locally):
+# Before blocking:
+ping -c 3 <eth1-ip>          # Should succeed
+
+# Block the test IP:
+sudo ./firewall block <test-machine-ip>/32
+
+# After blocking:
+ping -c 3 <eth1-ip>          # Should time out (packets silently dropped)
+
+# ── Verify with bpftool ──────────────────────────────────────────
+# List loaded BPF programs
+bpftool prog list
+# Look for: type xdp  name firewall_main
+
+# Inspect BPF maps
+bpftool map list
+# You should see: blocklist_ipv4 (lpm_trie), allow_ports (hash), stats_map (percpu_hash)
+
+# Dump the blocklist
+bpftool map dump name blocklist_ipv4
+
+# Dump port rules
+bpftool map dump name allow_ports
+
+# ── Performance sanity check ─────────────────────────────────────
+# Install hping3 for packet generation
+sudo apt install hping3
+
+# Flood SYN packets to a blocked IP and measure drop rate
+sudo hping3 -S -p 80 --faster <eth1-ip>
+
+# In another terminal, watch stats:
+watch -n 1 'sudo ./firewall stats'
+
+# ── Test the REST API end-to-end ─────────────────────────────────
+# Health check
+curl http://localhost:8080/api/health
+# → {"status":"ok"}
+
+# Block a subnet
+curl -X POST http://localhost:8080/api/block \
+  -H "Content-Type: application/json" \
+  -d '{"ip":"192.168.100.0","prefix":24}'
+# → {"ok":"blocked 192.168.100.0/24"}
+
+# Allow a custom port
+curl -X POST http://localhost:8080/api/port/allow \
+  -H "Content-Type: application/json" \
+  -d '{"port":8443,"protocol":"tcp"}'
+# → {"ok":"allowed port 8443/tcp"}
+
+# Get stats
+curl http://localhost:8080/api/stats
+# → [{"ip":"192.168.100.5","stats":{"packets_dropped":142,...}}]
+```
+
+---
+
+## 10. Troubleshooting
+
+### XDP loaded in generic mode instead of native
+
+```bash
+# Symptom: ip link show eth1 says "xdpgeneric" instead of "xdp"
+# Cause 1: MTU too large
+sudo ip link set eth1 mtu 3498
+
+# Cause 2: Too many combined channels
+sudo ethtool -L eth1 combined 2
+
+# Cause 3: ENA driver too old
+modinfo ena | grep version
+# Need >= 2.2.0; update kernel: sudo apt upgrade linux-image-$(uname -r)
+
+# Verify native after fixes:
+ip link show eth1 | grep -o 'xdp[^ ]*'
+# Should print "xdp" (not "xdpgeneric")
+```
+
+### Verifier rejection errors
+
+```bash
+# Symptom: program.load() returns an error mentioning "verifier"
+# Fix: run bpftool to see the full verifier log
+bpftool prog load firewall.o /sys/fs/bpf/fw type xdp 2>&1 | head -100
+
+# Common causes:
+# "invalid access to map value"    → forgot BOUNDS_CHECK somewhere
+# "R1 type=inv expected=ctx"       → wrong SEC() annotation
+# "back-edge from insn X to Y"     → loop detected (BPF doesn't allow unbounded loops)
+# "program too large"              → simplify logic; kernel has ~1M instruction limit
+```
+
+### SSH lockout prevention
+
+```bash
+# ALWAYS check this before enabling the firewall:
+sudo ./firewall stats   # confirm port 22 is in the allowlist
+
+# Emergency recovery: if locked out, use AWS Session Manager
+# (EC2 Console → Connect → Session Manager — doesn't need port 22)
+
+# Or detach XDP directly:
+sudo ip link set eth1 xdpgeneric off
+sudo ip link set eth1 xdp off
+```
+
+### Build failures
+
+```bash
+# "vmlinux.h not found"
+# The BTF dump requires kernel BTF support
+ls /sys/kernel/btf/vmlinux     # must exist
+bpftool btf dump file /sys/kernel/btf/vmlinux format c > kernel/vmlinux.h
+
+# Rust "bpf-linker not found"
+cargo install bpf-linker
+# If it fails: ensure llvm is installed
+sudo apt install llvm-14 clang-14
+
+# Go "module not found"
+cd management && go mod tidy
+```
+
+---
+
+## Quick Reference
+
+```bash
+# ── Load firewall ─────────────────────────────────────────────────
+sudo ./ebpf-control eth1 ./firewall.o
+
+# ── Block/unblock ─────────────────────────────────────────────────
+sudo ./firewall block 1.2.3.0/24
+sudo ./firewall unblock 1.2.3.0/24
+sudo ./firewall block 185.220.101.0/24   # Known Tor exit node range
+
+# ── Port rules ───────────────────────────────────────────────────
+sudo ./firewall allow 22 tcp             # SSH
+sudo ./firewall allow 80 tcp             # HTTP
+sudo ./firewall allow 443 tcp            # HTTPS
+sudo ./firewall deny 23                  # Telnet (explicitly)
+
+# ── Monitor ───────────────────────────────────────────────────────
+sudo ./firewall stats
+watch -n 2 'sudo ./firewall stats'
+
+# ── Emergency off switch ──────────────────────────────────────────
+sudo ./firewall disable                  # Disables via config_map (no reload)
+sudo ip link set eth1 xdp off            # Nuclear option: removes XDP entirely
+
+# ── Inspect kernel state ──────────────────────────────────────────
+bpftool prog list
+bpftool map list
+bpftool map dump name blocklist_ipv4
+bpftool map dump name allow_ports
+```
+
+---
+
+*Built with: Linux 6.8+ · Clang 17 · Rust 1.78 (nightly) · Aya 0.12 · Go 1.22 · AWS ENA driver 2.x*
+
+Good. I have full context from your setup.md. The environment is AWS t3.small + Ubuntu 24.04 + ENA with XDP native configured. Setup is done. Now we build the project.
+
+Here is the complete codebase. I'll go file by file in dependency order — common types first, kernel program second, user-space loader third, build tooling, then Go CLI.
+
+---
+
+## Project structure
+
+```
+ebpfirewall/
+├── rust-toolchain.toml
+├── Cargo.toml                   ← workspace (excludes eBPF crate)
+├── Makefile
+├── ebpfirewall-common/          ← shared types (no_std, compiles for both targets)
+│   ├── Cargo.toml
+│   └── src/lib.rs
+├── ebpfirewall-ebpf/            ← XDP kernel program (bpfel-unknown-none)
+│   ├── Cargo.toml
+│   ├── .cargo/config.toml
+│   └── src/main.rs
+├── ebpfirewall/                 ← Aya loader + CLI (x86_64-unknown-linux-gnu)
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── xtask/                       ← cargo xtask build helper
+│   ├── Cargo.toml
+│   └── src/main.rs
+├── scripts/
+│   ├── verify_setup.sh          ← pre-flight checks before any build
+│   └── integration_test.sh
+└── ebpfctl/                     ← Go management CLI (accesses pinned maps)
+    ├── go.mod
+    └── main.go
+```
+
+---
+
+## `rust-toolchain.toml`
+
+```toml
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+targets   = ["bpfel-unknown-none", "x86_64-unknown-linux-gnu"]
+```
+
+Nightly is required for `-Z build-std=core` used when cross-compiling for `bpfel-unknown-none`.
+
+---
+
+## `Cargo.toml` (workspace root)
+
+```toml
+[workspace]
+members  = ["ebpfirewall", "ebpfirewall-common", "xtask"]
+exclude  = ["ebpfirewall-ebpf"]   # different target — built via xtask
+resolver = "2"
+
+[profile.dev]
+opt-level = 3     # eBPF verifier handles simpler IR; optimize even in dev
+
+[profile.release]
+opt-level = 3
+debug     = 2     # keep symbols for bpftool / perf
+strip     = false
+lto       = true
+```
+
+`ebpfirewall-ebpf` is excluded from the workspace because it targets `bpfel-unknown-none`, not the host. Mixing targets in one workspace workspace causes `cargo build` to try both, which breaks.
+
+---
+
+## `ebpfirewall-common/Cargo.toml`
+
+```toml
+[package]
+name    = "ebpfirewall-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["user"]
+user    = []          # enables std-dependent derives (Hash, Debug with fmt)
+```
+
+---
+
+## `ebpfirewall-common/src/lib.rs`
+
+```rust
+//! Types shared between the eBPF kernel program and the Aya user-space loader.
+//!
+//! This crate must compile for BOTH targets:
+//!   - bpfel-unknown-none  (no_std)  → used by ebpfirewall-ebpf
+//!   - x86_64-unknown-linux-gnu      → used by ebpfirewall (default feature "user")
+//!
+//! Rule: never import anything from std here unless gated on `#[cfg(feature = "user")]`.
+
+#![cfg_attr(not(feature = "user"), no_std)]
+
+// ─── Firewall rule key (5-tuple) ──────────────────────────────────────────
+//
+// All fields are in HOST byte order. The XDP program converts from network
+// byte order (wire) to host byte order before doing map lookups.
+// User-space does the same when inserting.
+//
+// #[repr(C)] is critical: the BPF verifier sees this as a raw byte key.
+// Padding bytes must be zeroed — the verifier will reject uninitialized key bytes.
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[cfg_attr(feature = "user", derive(Hash))]
+pub struct FirewallKey {
+    pub src_ip:   u32,
+    pub dst_ip:   u32,
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub _pad:     [u8; 3],   // MUST be zero — verifier checks all key bytes
+}
+
+// ─── Per-CPU packet statistics ───────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PacketStats {
+    pub packets: u64,
+    pub bytes:   u64,   // reserved for future byte accounting
+}
+
+// ─── Index constants for PACKET_STATS PerCpuArray ────────────────────────
+
+pub const STATS_IDX_PASS: u32 = 0;
+pub const STATS_IDX_DROP: u32 = 1;
+
+// ─── Firewall actions ─────────────────────────────────────────────────────
+
+pub const ACTION_PASS: u32 = 0;
+pub const ACTION_DROP: u32 = 1;
+pub const ACTION_LOG:  u32 = 2;   // future: log + pass
+
+// ─── Protocol bitmask for PORT_BLOCKLIST ──────────────────────────────────
+
+pub const PROTO_TCP:  u8 = 1 << 0;
+pub const PROTO_UDP:  u8 = 1 << 1;
+pub const PROTO_BOTH: u8 = PROTO_TCP | PROTO_UDP;
+```
+
+---
+
+## `ebpfirewall-ebpf/.cargo/config.toml`
+
+```toml
+[build]
+target = "bpfel-unknown-none"
+
+[unstable]
+build-std = ["core"]
+```
+
+---
+
+## `ebpfirewall-ebpf/Cargo.toml`
+
+```toml
+[package]
+name    = "ebpfirewall-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf             = { version = "0.1" }
+aya-log-ebpf         = { version = "0.1" }
+network-types        = { version = "0.0.7" }
+ebpfirewall-common   = { path = "../ebpfirewall-common", default-features = false }
+
+[profile.dev]
+opt-level       = 3
+debug           = false
+lto             = true
+codegen-units   = 1
+panic           = "abort"    # no unwinding runtime in BPF
+
+[profile.release]
+opt-level       = 3
+debug           = false
+lto             = true
+codegen-units   = 1
+panic           = "abort"
+```
+
+---
+
+## `ebpfirewall-ebpf/src/main.rs` — XDP kernel program
+
+```rust
+#![no_std]
+#![no_main]
+#![allow(nonstandard_style)]   // BPF map names are UPPER_SNAKE per convention
+
+use aya_ebpf::{
+    bindings::xdp_action,
+    macros::{map, xdp},
+    maps::{HashMap, PerCpuArray},
+    programs::XdpContext,
+};
+use core::mem;
+use network_types::{
+    eth::{EthHdr, EtherType},
+    ip::{IpProto, Ipv4Hdr},
+    tcp::TcpHdr,
+    udp::UdpHdr,
+};
+use ebpfirewall_common::{
+    ACTION_DROP,
+    FirewallKey, PacketStats,
+    PROTO_TCP, PROTO_UDP,
+    STATS_IDX_DROP, STATS_IDX_PASS,
+};
+
+// ─── BPF Maps ─────────────────────────────────────────────────────────────
+//
+// Map names become ELF section names in the compiled .o object.
+// The Aya user-space loader accesses them by these exact name strings.
+//
+// Key/value byte order convention (applies to ALL maps):
+//   Keys are stored in HOST byte order (little-endian on x86).
+//   The XDP program converts from network byte order (wire format) before lookup.
+//   The user-space loader must also insert in host byte order.
+//   See: byte_order_contract() comment in process_ipv4().
+
+/// Source IPv4 address blocklist.
+/// Key:   src_ip in host byte order.
+/// Value: reason code (unused, reserved for future rate-limit tiers).
+#[map]
+static BLOCKLIST_IPV4: HashMap<u32, u32> =
+    HashMap::with_max_entries(65536, 0);
+
+/// Destination port blocklist.
+/// Key:   dst_port in host byte order (u16 = 0..65535).
+/// Value: protocol bitmask — PROTO_TCP | PROTO_UDP.
+#[map]
+static PORT_BLOCKLIST: HashMap<u16, u8> =
+    HashMap::with_max_entries(1024, 0);
+
+/// 5-tuple firewall rules.
+/// Key:   FirewallKey (all fields host byte order, _pad MUST be zero).
+/// Value: ACTION_PASS | ACTION_DROP | ACTION_LOG.
+#[map]
+static FIREWALL_RULES: HashMap<FirewallKey, u32> =
+    HashMap::with_max_entries(65536, 0);
+
+/// Per-CPU packet counters.
+/// Index 0 (STATS_IDX_PASS): packets that passed.
+/// Index 1 (STATS_IDX_DROP): packets that were dropped.
+/// PerCpuArray avoids cache-line contention on multi-core — each CPU
+/// writes to its own slot; user space aggregates across CPUs.
+#[map]
+static PACKET_STATS: PerCpuArray<PacketStats> =
+    PerCpuArray::with_max_entries(2, 0);
+
+// ─── XDP entry point ──────────────────────────────────────────────────────
+
+#[xdp]
+pub fn xdp_firewall(ctx: XdpContext) -> u32 {
+    // Wrap in Result so we can use `?` for bounds-check propagation.
+    // XDP_ABORTED signals a programming error — visible in bpftool stats.
+    match try_firewall(&ctx) {
+        Ok(action) => action,
+        Err(_)     => xdp_action::XDP_ABORTED,
+    }
+}
+
+#[inline(always)]
+fn try_firewall(ctx: &XdpContext) -> Result<u32, ()> {
+    let eth: *const EthHdr = ptr_at(ctx, 0)?;
+
+    match unsafe { (*eth).ether_type } {
+        EtherType::Ipv4 => process_ipv4(ctx, EthHdr::LEN),
+        // Pass everything else: ARP, IPv6 (handle IPv6 separately later),
+        // 802.1Q, etc.
+        _ => Ok(xdp_action::XDP_PASS),
+    }
+}
+
+// ─── IPv4 processing ──────────────────────────────────────────────────────
+
+fn process_ipv4(ctx: &XdpContext, eth_len: usize) -> Result<u32, ()> {
+    let ip: *const Ipv4Hdr = ptr_at(ctx, eth_len)?;
+
+    // ── Byte order contract ────────────────────────────────────────────
+    // Wire format (NBO, big-endian). On bpfel (little-endian eBPF VM):
+    //   reading bytes [0x01, 0x02, 0x03, 0x04] as u32 = 0x04030201
+    //   u32::from_be(0x04030201) = 0x01020304 = host-order repr of 1.2.3.4
+    //
+    // User-space: u32::from(Ipv4Addr::new(1,2,3,4)) = 0x01020304 (same)
+    // Both sides use host byte order in the map. ✓
+
+    let src_ip = u32::from_be(unsafe { (*ip).src_addr });
+    let dst_ip = u32::from_be(unsafe { (*ip).dst_addr });
+    let proto  = unsafe { (*ip).proto };
+
+    // IHL is the IP header length in 32-bit words; multiply by 4 for bytes.
+    // We need this to skip over IP options to reach the transport header.
+    let ihl      = unsafe { (((*ip).version_ihl & 0x0F) * 4) as usize };
+    let l4_start = eth_len + ihl;
+
+    // ── Stage 1: IP blocklist (checked before L4 parsing) ─────────────
+    // This is the hot path for blocked hosts — avoid unnecessary parsing.
+    if BLOCKLIST_IPV4.get(&src_ip).is_some() {
+        bump_stats(STATS_IDX_DROP);
+        return Ok(xdp_action::XDP_DROP);
+    }
+
+    // ── Parse L4 headers ──────────────────────────────────────────────
+    let (src_port, dst_port) = parse_ports(ctx, l4_start, proto)?;
+
+    // ── Stage 2: Port blocklist ────────────────────────────────────────
+    // Same byte-order contract: ports are stored in host order.
+    if dst_port != 0 {
+        if let Some(&mask) = PORT_BLOCKLIST.get(&dst_port) {
+            let proto_bit = proto_to_bit(proto);
+            if proto_bit != 0 && (mask & proto_bit != 0) {
+                bump_stats(STATS_IDX_DROP);
+                return Ok(xdp_action::XDP_DROP);
+            }
+        }
+    }
+
+    // ── Stage 3: 5-tuple rule table ────────────────────────────────────
+    // Most specific match. All FirewallKey fields in host byte order.
+    // _pad MUST be zeroed — BPF verifier checks every byte of the key.
+    let key = FirewallKey {
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        protocol: proto as u8,
+        _pad: [0u8; 3],
+    };
+
+    if let Some(&action) = FIREWALL_RULES.get(&key) {
+        if action == ACTION_DROP {
+            bump_stats(STATS_IDX_DROP);
+            return Ok(xdp_action::XDP_DROP);
+        }
+        bump_stats(STATS_IDX_PASS);
+        return Ok(xdp_action::XDP_PASS);
+    }
+
+    // ── Default policy: PASS ───────────────────────────────────────────
+    // Change to XDP_DROP here for a default-deny posture.
+    // In that mode, only explicitly allowed rules let traffic through.
+    bump_stats(STATS_IDX_PASS);
+    Ok(xdp_action::XDP_PASS)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+/// Parse source and destination ports from TCP or UDP header.
+/// Returns (0, 0) for protocols with no port concept (ICMP, etc.).
+#[inline(always)]
+fn parse_ports(ctx: &XdpContext, offset: usize, proto: IpProto)
+    -> Result<(u16, u16), ()>
+{
+    match proto {
+        IpProto::Tcp => {
+            let hdr: *const TcpHdr = ptr_at(ctx, offset)?;
+            Ok(unsafe {
+                (u16::from_be((*hdr).source), u16::from_be((*hdr).dest))
+            })
+        }
+        IpProto::Udp => {
+            let hdr: *const UdpHdr = ptr_at(ctx, offset)?;
+            Ok(unsafe {
+                (u16::from_be((*hdr).source), u16::from_be((*hdr).dest))
+            })
+        }
+        _ => Ok((0u16, 0u16)),
+    }
+}
+
+/// Map IpProto to the bitmask used in PORT_BLOCKLIST.
+#[inline(always)]
+fn proto_to_bit(proto: IpProto) -> u8 {
+    match proto {
+        IpProto::Tcp => PROTO_TCP,
+        IpProto::Udp => PROTO_UDP,
+        _             => 0,
+    }
+}
+
+/// Bounds-checked pointer into XDP packet data.
+///
+/// This is the ONLY safe way to access packet bytes in an XDP program.
+/// The BPF verifier statically traces every memory access; any path where
+/// `start + offset + size_of::<T>()` could exceed `data_end` will be rejected.
+/// The explicit comparison here satisfies the verifier.
+///
+/// Must be #[inline(always)] — the verifier tracks bounds PER CALL SITE.
+/// If this were not inlined, the verifier would need to re-verify bounds
+/// at every call, which older kernels reject.
+#[inline(always)]
+fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end   = ctx.data_end();
+    let size  = mem::size_of::<T>();
+
+    if start + offset + size > end {
+        return Err(());   // packet too short — bounds check failed
+    }
+    Ok((start + offset) as *const T)
+}
+
+/// Increment per-CPU packet counter. wrapping_add prevents overflow traps.
+#[inline(always)]
+fn bump_stats(idx: u32) {
+    if let Some(s) = PACKET_STATS.get_ptr_mut(idx) {
+        unsafe {
+            (*s).packets = (*s).packets.wrapping_add(1);
+        }
+    }
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    // BPF programs should never panic. This satisfies the linker.
+    // The verifier rejects programs with reachable panic paths anyway.
+    unsafe { core::hint::unreachable_unchecked() }
+}
+```
+
+---
+
+## `ebpfirewall/Cargo.toml`
+
+```toml
+[package]
+name        = "ebpfirewall"
+version     = "0.1.0"
+edition     = "2021"
+description = "XDP firewall — Aya loader, rule manager, pinned-map CLI"
+
+[[bin]]
+name = "ebpfirewall"
+path = "src/main.rs"
+
+[dependencies]
+aya                  = { version = "0.13", features = ["async_tokio"] }
+aya-log              = { version = "0.2" }
+ebpfirewall-common   = { path = "../ebpfirewall-common" }
+anyhow               = "1"
+clap                 = { version = "4", features = ["derive"] }
+env_logger           = "0.11"
+log                  = "0.4"
+tokio                = { version = "1", features = ["full"] }
+```
+
+---
+
+## `ebpfirewall/src/main.rs` — Aya loader + CLI
+
+```rust
+//! ebpfirewall — user-space control plane
+//!
+//! Two modes of operation:
+//!
+//!   DAEMON mode (`start`):
+//!     Loads the XDP program, attaches it to the interface, pins BPF maps
+//!     to /sys/fs/bpf/ebpfirewall/, then loops until Ctrl+C.
+//!     After pinning, any sub-command (block-ip, stats, …) can run
+//!     concurrently without re-loading the eBPF object.
+//!
+//!   COMMAND mode (block-ip, stats, …):
+//!     Opens the pinned maps directly (does NOT re-load the BPF object),
+//!     performs the operation, and exits.
+//!     This is the correct pattern for tools like ip(8), tc(8), bpftool.
+
+use anyhow::{bail, Context, Result};
+use aya::{
+    maps::{HashMap, MapData, PerCpuArray},
+    programs::{Xdp, XdpFlags},
+    Bpf,
+};
+use aya_log::BpfLogger;
+use clap::{Parser, Subcommand};
+use ebpfirewall_common::{
+    FirewallKey, PacketStats, ACTION_DROP, ACTION_PASS,
+    PROTO_BOTH, PROTO_TCP, PROTO_UDP, STATS_IDX_DROP, STATS_IDX_PASS,
+};
+use log::{info, warn};
+use std::net::Ipv4Addr;
+use std::path::Path;
+use std::time::Duration;
+use tokio::{signal, time};
+
+// Pinned map paths. The Go CLI (ebpfctl) uses these same paths.
+const PIN_DIR:      &str = "/sys/fs/bpf/ebpfirewall";
+const PIN_BLOCKLIST: &str = "/sys/fs/bpf/ebpfirewall/BLOCKLIST_IPV4";
+const PIN_PORTS:    &str = "/sys/fs/bpf/ebpfirewall/PORT_BLOCKLIST";
+const PIN_RULES:    &str = "/sys/fs/bpf/ebpfirewall/FIREWALL_RULES";
+const PIN_STATS:    &str = "/sys/fs/bpf/ebpfirewall/PACKET_STATS";
+
+// ─── CLI ──────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(name = "ebpfirewall", version, about = "XDP firewall control plane")]
+struct Cli {
+    #[arg(short, long, default_value = "eth1")]
+    iface: String,
+
+    /// Use generic XDP (SKB mode) — no ENA driver requirement.
+    /// Native mode is the default and must be used for ENA performance.
+    #[arg(long, default_value_t = false)]
+    generic: bool,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Load XDP program, attach to interface, pin maps, run as daemon.
+    Start,
+
+    /// Block all packets from a source IPv4 address.
+    BlockIp { ip: Ipv4Addr },
+
+    /// Remove an IP from the blocklist.
+    UnblockIp { ip: Ipv4Addr },
+
+    /// Block a destination port. --proto tcp|udp|both
+    BlockPort {
+        port: u16,
+        #[arg(long, default_value = "both")]
+        proto: String,
+    },
+
+    /// Remove a port from the blocklist.
+    UnblockPort { port: u16 },
+
+    /// Add a 5-tuple rule. --action drop|pass
+    AddRule {
+        src_ip:   Ipv4Addr,
+        dst_ip:   Ipv4Addr,
+        src_port: u16,
+        dst_port: u16,
+        proto:    String,
+        #[arg(long, default_value = "drop")]
+        action: String,
+    },
+
+    /// Print aggregated per-CPU packet counters.
+    Stats,
+
+    /// Print all blocked source IPs.
+    ListBlockedIps,
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    match &cli.cmd {
+        Cmd::Start => cmd_start(&cli.iface, cli.generic).await,
+
+        // All other commands access pinned maps — no BPF object load needed.
+        Cmd::BlockIp     { ip }             => cmd_block_ip(*ip),
+        Cmd::UnblockIp   { ip }             => cmd_unblock_ip(*ip),
+        Cmd::BlockPort   { port, proto }    => cmd_block_port(*port, proto),
+        Cmd::UnblockPort { port }           => cmd_unblock_port(*port),
+        Cmd::AddRule { src_ip, dst_ip, src_port, dst_port, proto, action } =>
+            cmd_add_rule(*src_ip, *dst_ip, *src_port, *dst_port, proto, action),
+        Cmd::Stats        => cmd_stats(),
+        Cmd::ListBlockedIps => cmd_list_ips(),
+    }
+}
+
+// ─── Daemon: load + attach + pin ──────────────────────────────────────────
+
+async fn cmd_start(iface: &str, generic: bool) -> Result<()> {
+    // Embed the compiled eBPF object at build time.
+    // Run `cargo xtask build-ebpf` before `cargo build`.
+    let bpf_bytes: &[u8] = {
+        #[cfg(debug_assertions)]
+        { include_bytes!("../../target/bpfel-unknown-none/debug/ebpfirewall-ebpf") }
+        #[cfg(not(debug_assertions))]
+        { include_bytes!("../../target/bpfel-unknown-none/release/ebpfirewall-ebpf") }
+    };
+
+    let mut bpf = Bpf::load(bpf_bytes)
+        .context("BPF object load failed — did you run `cargo xtask build-ebpf`?")?;
+
+    if let Err(e) = BpfLogger::init(&mut bpf) {
+        warn!("aya-log ring-buffer unavailable: {} — kernel log disabled", e);
+    }
+
+    // ── Attach XDP ──────────────────────────────────────────────────────
+    let flags = if generic { XdpFlags::SKB_MODE } else { XdpFlags::default() };
+
+    let prog: &mut Xdp = bpf
+        .program_mut("xdp_firewall")
+        .context("program 'xdp_firewall' not in object — check ebpf crate")?
+        .try_into()?;
+
+    prog.load().context("BPF verifier rejected the program")?;
+    prog.attach(iface, flags).with_context(|| {
+        format!(
+            "attach to {} failed. \
+             For native mode: MTU must be ≤3498 and channels reduced. \
+             Check: ip link show {0} | grep xdp",
+            iface
+        )
+    })?;
+
+    info!(
+        "XDP firewall ATTACHED to {} mode={}",
+        iface,
+        if generic { "generic(SKB)" } else { "native(DRV)" }
+    );
+
+    // ── Pin maps to bpffs ───────────────────────────────────────────────
+    // Pinning allows the Go CLI and future `ebpfirewall <cmd>` invocations
+    // to access live maps without re-loading the BPF object.
+    std::fs::create_dir_all(PIN_DIR)
+        .context("failed to create BPF pin directory — is bpffs mounted at /sys/fs/bpf?")?;
+
+    for (name, path) in &[
+        ("BLOCKLIST_IPV4", PIN_BLOCKLIST),
+        ("PORT_BLOCKLIST",  PIN_PORTS),
+        ("FIREWALL_RULES",  PIN_RULES),
+        ("PACKET_STATS",    PIN_STATS),
+    ] {
+        // Skip if already pinned (e.g. after a daemon restart)
+        if Path::new(path).exists() {
+            continue;
+        }
+        bpf.map(name)
+            .with_context(|| format!("map {} not found", name))?
+            .pin(path)
+            .with_context(|| format!("pin {} to {} failed", name, path))?;
+        info!("Pinned {} → {}", name, path);
+    }
+
+    info!("Maps pinned. Go CLI: cd ebpfctl && go run . -stats");
+    info!("Ctrl+C to detach and stop");
+
+    // ── Event loop with periodic stats ─────────────────────────────────
+    let mut tick = time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = tick.tick()       => { let _ = cmd_stats(); }
+            _ = signal::ctrl_c() => {
+                info!("Detaching XDP program and removing pins");
+                // Aya drops the Bpf object here, which auto-detaches.
+                // Clean up pin files so next run re-pins.
+                for (_, path) in &[
+                    ("", PIN_BLOCKLIST),
+                    ("", PIN_PORTS),
+                    ("", PIN_RULES),
+                    ("", PIN_STATS),
+                ] {
+                    let _ = std::fs::remove_file(path);
+                }
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── Pinned-map commands ──────────────────────────────────────────────────
+
+fn cmd_block_ip(ip: Ipv4Addr) -> Result<()> {
+    let data = MapData::from_pin(PIN_BLOCKLIST)
+        .context("failed to open pinned BLOCKLIST_IPV4 — is the daemon running?")?;
+    let mut map: HashMap<_, u32, u32> = HashMap::try_from(data)?;
+
+    // u32::from(ip) gives the host-byte-order representation of the IP.
+    // The XDP program uses the same convention after u32::from_be(src_addr).
+    map.insert(u32::from(ip), 0u32, 0)?;
+    println!("Blocked: {}", ip);
+    Ok(())
+}
+
+fn cmd_unblock_ip(ip: Ipv4Addr) -> Result<()> {
+    let data = MapData::from_pin(PIN_BLOCKLIST)
+        .context("BLOCKLIST_IPV4 not pinned — is the daemon running?")?;
+    let mut map: HashMap<_, u32, u32> = HashMap::try_from(data)?;
+    map.remove(&u32::from(ip))?;
+    println!("Unblocked: {}", ip);
+    Ok(())
+}
+
+fn cmd_block_port(port: u16, proto: &str) -> Result<()> {
+    let mask: u8 = match proto {
+        "tcp"  => PROTO_TCP,
+        "udp"  => PROTO_UDP,
+        "both" => PROTO_BOTH,
+        other  => bail!("unknown protocol '{}' — use tcp|udp|both", other),
+    };
+    let data = MapData::from_pin(PIN_PORTS)
+        .context("PORT_BLOCKLIST not pinned")?;
+    let mut map: HashMap<_, u16, u8> = HashMap::try_from(data)?;
+    map.insert(port, mask, 0)?;
+    println!("Blocked port {} ({})", port, proto);
+    Ok(())
+}
+
+fn cmd_unblock_port(port: u16) -> Result<()> {
+    let data = MapData::from_pin(PIN_PORTS)?;
+    let mut map: HashMap<_, u16, u8> = HashMap::try_from(data)?;
+    map.remove(&port)?;
+    println!("Unblocked port {}", port);
+    Ok(())
+}
+
+fn cmd_add_rule(
+    src_ip: Ipv4Addr, dst_ip: Ipv4Addr,
+    src_port: u16, dst_port: u16,
+    proto: &str, action: &str,
+) -> Result<()> {
+    let proto_num: u8 = match proto {
+        "tcp"  => 6,
+        "udp"  => 17,
+        "icmp" => 1,
+        other  => bail!("unknown proto '{}'", other),
+    };
+    let action_val: u32 = match action {
+        "drop" => ACTION_DROP,
+        "pass" => ACTION_PASS,
+        other  => bail!("unknown action '{}' — use drop|pass", other),
+    };
+    let key = FirewallKey {
+        src_ip:   u32::from(src_ip),
+        dst_ip:   u32::from(dst_ip),
+        src_port,
+        dst_port,
+        protocol: proto_num,
+        _pad:     [0u8; 3],
+    };
+    let data = MapData::from_pin(PIN_RULES)?;
+    let mut map: HashMap<_, FirewallKey, u32> = HashMap::try_from(data)?;
+    map.insert(key, action_val, 0)?;
+    println!("Rule added: {}:{} → {}:{} proto={} action={}", src_ip, src_port, dst_ip, dst_port, proto, action);
+    Ok(())
+}
+
+fn cmd_stats() -> Result<()> {
+    let data = MapData::from_pin(PIN_STATS)
+        .context("PACKET_STATS not pinned — is the daemon running?")?;
+    let map: PerCpuArray<_, PacketStats> = PerCpuArray::try_from(data)?;
+
+    let pass_vals = map.get(&STATS_IDX_PASS, 0)?;
+    let drop_vals = map.get(&STATS_IDX_DROP, 0)?;
+
+    let (total_pass, total_drop) = pass_vals
+        .iter()
+        .zip(drop_vals.iter())
+        .fold((0u64, 0u64), |(p, d), (pv, dv)| (p + pv.packets, d + dv.packets));
+
+    println!("PASSED   {:>12}", total_pass);
+    println!("DROPPED  {:>12}", total_drop);
+    Ok(())
+}
+
+fn cmd_list_ips() -> Result<()> {
+    let data = MapData::from_pin(PIN_BLOCKLIST)?;
+    let map: HashMap<_, u32, u32> = HashMap::try_from(data)?;
+    let mut count = 0usize;
+    for entry in map.iter() {
+        let (key, _) = entry?;
+        println!("{}", Ipv4Addr::from(key));
+        count += 1;
+    }
+    if count == 0 { println!("(no blocked IPs)"); }
+    Ok(())
+}
+```
+
+---
+
+## `xtask/Cargo.toml`
+
+```toml
+[package]
+name    = "xtask"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+```
+
+---
+
+## `xtask/src/main.rs`
+
+```rust
+//! cargo xtask — build helper for the eBPF crate.
+//!
+//! The eBPF crate targets `bpfel-unknown-none` and requires
+//! `-Z build-std=core` (nightly only). Normal `cargo build` cannot
+//! do this for the workspace automatically, so we use xtask.
+//!
+//! Usage:
+//!   cargo xtask build-ebpf            # debug
+//!   cargo xtask build-ebpf-release    # release
+
+use anyhow::{bail, Context, Result};
+use std::{env, process::Command};
+
+fn main() -> Result<()> {
+    let task = env::args().nth(1).unwrap_or_default();
+    match task.as_str() {
+        "build-ebpf"         => build_ebpf(false),
+        "build-ebpf-release" => build_ebpf(true),
+        other => {
+            eprintln!("Unknown task: {other}");
+            eprintln!("Available: build-ebpf, build-ebpf-release");
+            bail!("no task selected");
+        }
+    }
+}
+
+fn build_ebpf(release: bool) -> Result<()> {
+    let mut cmd = Command::new("cargo");
+    cmd.args([
+        "+nightly",
+        "build",
+        "--package", "ebpfirewall-ebpf",
+        "-Z", "build-std=core",
+        "--target", "bpfel-unknown-none",
+    ]);
+
+    if release {
+        cmd.arg("--release");
+    }
+
+    println!(
+        "Building eBPF object [{}]...",
+        if release { "release" } else { "debug" }
+    );
+
+    let status = cmd
+        .status()
+        .context("failed to spawn cargo — is nightly installed? run: rustup toolchain install nightly")?;
+
+    if !status.success() {
+        bail!("eBPF build failed (status {})", status);
+    }
+
+    println!("eBPF build OK");
+    Ok(())
+}
+```
+
+---
+
+## `Makefile`
+
+```makefile
+IFACE   ?= eth1
+DEBUG   := ./target/debug/ebpfirewall
+RELEASE := ./target/release/ebpfirewall
+PIN_DIR := /sys/fs/bpf/ebpfirewall
+
+.PHONY: all build build-ebpf build-release run stop fmt lint \
+        test verify clean block-ip stats
+
+all: build
+
+# ── Build ──────────────────────────────────────────────────────────────────
+
+build-ebpf:
+	cargo xtask build-ebpf
+
+build: build-ebpf
+	cargo build --workspace --exclude ebpfirewall-ebpf
+
+build-release:
+	cargo xtask build-ebpf-release
+	cargo build --release --workspace --exclude ebpfirewall-ebpf
+
+# ── Run ────────────────────────────────────────────────────────────────────
+
+run: build
+	sudo RUST_LOG=info $(DEBUG) --iface $(IFACE) start
+
+# Detach without waiting for daemon (useful if daemon is hung)
+stop:
+	sudo ip link set $(IFACE) xdp off 2>/dev/null || true
+	sudo rm -rf $(PIN_DIR) || true
+
+stats: build
+	sudo $(DEBUG) stats
+
+# ── Go CLI ─────────────────────────────────────────────────────────────────
+
+go-build:
+	cd ebpfctl && go build -o ../ebpfctl-bin .
+
+go-stats:
+	sudo ./ebpfctl-bin -stats
+
+# ── Quality ────────────────────────────────────────────────────────────────
+
+fmt:
+	cargo fmt --all
+	cargo fmt --manifest-path ebpfirewall-ebpf/Cargo.toml
+
+lint:
+	cargo clippy --workspace --exclude ebpfirewall-ebpf -- -D warnings
+	cd ebpfctl && go vet ./...
+
+# ── Test ───────────────────────────────────────────────────────────────────
+
+verify:
+	bash scripts/verify_setup.sh
+
+test: build verify
+	sudo IFACE=$(IFACE) bash scripts/integration_test.sh
+
+# ── Clean ──────────────────────────────────────────────────────────────────
+
+clean:
+	cargo clean
+	sudo rm -rf $(PIN_DIR) || true
+	rm -f ebpfctl-bin
+```
+
+---
+
+## `scripts/verify_setup.sh`
+
+```bash
+#!/usr/bin/env bash
+# Pre-flight checks for running XDP native mode on AWS ENA.
+# Run this before `make build` on a fresh instance.
+
+set -euo pipefail
+IFACE="${IFACE:-eth1}"
+PASS=0; WARN=0; FAIL=0
+
+ok()   { echo "  [OK]   $*";   ((PASS++)); }
+warn() { echo "  [WARN] $*";   ((WARN++)); }
+fail() { echo "  [FAIL] $*";   ((FAIL++)); }
+
+echo "=== ebpfirewall pre-flight check ==="
+echo "Interface: $IFACE"
+echo
+
+# ── 1. Kernel version ──────────────────────────────────────────────────────
+KVER=$(uname -r)
+KMAJ=$(echo "$KVER" | cut -d. -f1)
+KMIN=$(echo "$KVER" | cut -d. -f2)
+if (( KMAJ > 5 )) || (( KMAJ == 5 && KMIN >= 9 )); then
+    ok "Kernel $KVER (≥ 5.9 required for ENA native XDP)"
+else
+    fail "Kernel $KVER is too old — need ≥ 5.9"
+fi
+
+# ── 2. ENA driver version ──────────────────────────────────────────────────
+ENA_VER=$(modinfo ena 2>/dev/null | awk '/^version:/{print $2}')
+if [[ -z "$ENA_VER" ]]; then
+    fail "ENA driver not loaded — not an AWS Nitro instance?"
+else
+    ENA_MAJ=$(echo "$ENA_VER" | cut -d. -f1)
+    ENA_MIN=$(echo "$ENA_VER" | cut -d. -f2)
+    if (( ENA_MAJ > 2 )) || (( ENA_MAJ == 2 && ENA_MIN >= 2 )); then
+        ok "ENA driver $ENA_VER (≥ 2.2.0 required for native XDP)"
+    else
+        fail "ENA driver $ENA_VER — native XDP requires ≥ 2.2.0"
+    fi
+fi
+
+# ── 3. Interface exists ────────────────────────────────────────────────────
+if ip link show "$IFACE" &>/dev/null; then
+    ok "Interface $IFACE exists"
+else
+    fail "Interface $IFACE not found — attach a second ENI in EC2 console"
+fi
+
+# ── 4. MTU ─────────────────────────────────────────────────────────────────
+MTU=$(ip link show "$IFACE" 2>/dev/null | awk '/mtu/{for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}')
+if [[ -n "$MTU" ]]; then
+    if (( MTU <= 3498 )); then
+        ok "MTU $MTU (≤ 3498 required for XDP on ENA)"
+    else
+        warn "MTU $MTU is too large for XDP native on ENA"
+        echo "       Fix: sudo ip link set $IFACE mtu 3498"
+    fi
+fi
+
+# ── 5. Channel count ───────────────────────────────────────────────────────
+if command -v ethtool &>/dev/null; then
+    COMBINED=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/{c++; if(c==2) print $2}')
+    if [[ -n "$COMBINED" ]]; then
+        if (( COMBINED <= 4 )); then
+            ok "Combined channels: $COMBINED"
+        else
+            warn "Combined channels: $COMBINED — consider halving for XDP native"
+            echo "       Fix: sudo ethtool -L $IFACE combined $((COMBINED / 2))"
+        fi
+    fi
+else
+    warn "ethtool not installed — cannot verify channel count"
+fi
+
+# ── 6. BPF filesystem ─────────────────────────────────────────────────────
+if mount | grep -q "bpf on /sys/fs/bpf"; then
+    ok "BPFfs mounted at /sys/fs/bpf"
+else
+    fail "BPFfs not mounted"
+    echo "       Fix: sudo mount -t bpf none /sys/fs/bpf"
+fi
+
+# ── 7. Required tools ─────────────────────────────────────────────────────
+for tool in clang cargo bpftool ip hping3; do
+    if command -v "$tool" &>/dev/null; then
+        ok "$tool available"
+    else
+        warn "$tool not found"
+    fi
+done
+
+# ── 8. Rust nightly + bpf target ──────────────────────────────────────────
+if rustup toolchain list 2>/dev/null | grep -q nightly; then
+    ok "Rust nightly toolchain present"
+else
+    fail "Rust nightly not installed: rustup toolchain install nightly"
+fi
+
+if rustup target list --toolchain nightly --installed 2>/dev/null \
+        | grep -q "bpfel-unknown-none"; then
+    ok "bpfel-unknown-none target installed"
+else
+    warn "bpfel-unknown-none target not installed"
+    echo "       Fix: rustup target add bpfel-unknown-none --toolchain nightly"
+fi
+
+# ── Summary ────────────────────────────────────────────────────────────────
+echo
+echo "Result: $PASS passed, $WARN warnings, $FAIL failed"
+(( FAIL == 0 )) && echo "Ready to build." || { echo "Fix failures before building."; exit 1; }
+```
+
+---
+
+## `scripts/integration_test.sh`
+
+```bash
+#!/usr/bin/env bash
+# Integration test: verifies that the XDP firewall correctly drops/passes
+# packets according to the blocklist.
+#
+# Requires: hping3, root, a running ebpfirewall daemon on $IFACE.
+
+set -euo pipefail
+IFACE="${IFACE:-eth1}"
+CTRL="sudo ./target/debug/ebpfirewall --iface $IFACE"
+PASS=0; FAIL=0
+
+log()  { echo "[TEST] $*"; }
+ok()   { echo "  PASS: $*"; ((PASS++)); }
+fail() { echo "  FAIL: $*"; ((FAIL++)); }
+
+require_root() {
+    [[ $EUID -eq 0 ]] || { echo "Run as root"; exit 1; }
+}
+
+# Read current drop counter from stats output
+drop_count() {
+    $CTRL stats 2>/dev/null | awk '/DROPPED/{print $2}'
+}
+
+# ── Test 1: Program loads and shows stats ─────────────────────────────────
+test_stats_reachable() {
+    log "Test: stats command reaches pinned maps"
+    if $CTRL stats &>/dev/null; then
+        ok "stats reachable"
+    else
+        fail "stats failed — is the daemon running? run: make run"
+    fi
+}
+
+# ── Test 2: XDP mode is native (not generic) ──────────────────────────────
+test_native_mode() {
+    log "Test: XDP native mode on $IFACE"
+    local output
+    output=$(ip link show "$IFACE")
+    if echo "$output" | grep -q " xdp " && ! echo "$output" | grep -q "xdpgeneric"; then
+        ok "XDP native mode confirmed"
+    elif echo "$output" | grep -q "xdpgeneric"; then
+        fail "XDP is in generic (SKB) mode — native mode required for ENA perf"
+    else
+        fail "XDP not attached — daemon not running?"
+    fi
+}
+
+# ── Test 3: block-ip → drop count increases ───────────────────────────────
+test_block_ip_drops() {
+    log "Test: block-ip causes drop counter to increase"
+    local TEST_IP="10.99.99.99"
+    
+    $CTRL block-ip "$TEST_IP" &>/dev/null
+    local before
+    before=$(drop_count)
+    
+    # Send 5 spoofed packets from blocked IP
+    sudo hping3 -S --spoof "$TEST_IP" -p 80 -c 5 \
+        "$(ip -4 addr show $IFACE | awk '/inet/{print $2}' | cut -d/ -f1)" \
+        &>/dev/null || true
+    
+    sleep 1
+    local after
+    after=$(drop_count)
+    
+    if (( after > before )); then
+        ok "Drop counter increased: $before → $after"
+    else
+        fail "Drop counter did not increase (before=$before after=$after)"
+        echo "       Hint: hping3 may require the same subnet; verify with tcpdump"
+    fi
+    
+    $CTRL unblock-ip "$TEST_IP" &>/dev/null
+}
+
+# ── Test 4: unblock-ip → traffic flows again ──────────────────────────────
+test_unblock_ip() {
+    log "Test: unblock-ip removes entry from map"
+    local TEST_IP="10.99.99.100"
+    $CTRL block-ip   "$TEST_IP" &>/dev/null
+    $CTRL unblock-ip "$TEST_IP" &>/dev/null
+    
+    # Verify the IP is gone from the list
+    if ! $CTRL list-blocked-ips 2>/dev/null | grep -q "$TEST_IP"; then
+        ok "IP removed from blocklist"
+    else
+        fail "IP still in blocklist after unblock"
+    fi
+}
+
+# ── Test 5: block-port ────────────────────────────────────────────────────
+test_block_port() {
+    log "Test: block-port 9999 tcp"
+    $CTRL block-port 9999 --proto tcp &>/dev/null
+    local before
+    before=$(drop_count)
+    
+    sudo hping3 -S -p 9999 -c 3 \
+        "$(ip -4 addr show $IFACE | awk '/inet/{print $2}' | cut -d/ -f1)" \
+        &>/dev/null || true
+    
+    sleep 1
+    local after
+    after=$(drop_count)
+    
+    if (( after > before )); then
+        ok "Port block working: drops $before → $after"
+    else
+        fail "Port block not working — check hping3 is sending to $IFACE IP"
+    fi
+    
+    $CTRL unblock-port 9999 &>/dev/null
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+require_root
+echo "=== ebpfirewall integration tests ==="
+echo "Interface: $IFACE"
+echo
+
+test_stats_reachable
+test_native_mode
+test_block_ip_drops
+test_unblock_ip
+test_block_port
+
+echo
+echo "Result: $PASS passed, $FAIL failed"
+(( FAIL == 0 )) || exit 1
+```
+
+---
+
+## `ebpfctl/go.mod`
+
+```go
+module github.com/sushink70/ebpfirewall/ebpfctl
+
+go 1.22
+
+require github.com/cilium/ebpf v0.15.0
+```
+
+---
+
+## `ebpfctl/main.go` — Go management CLI
+
+```go
+// ebpfctl — Go management CLI for ebpfirewall.
+//
+// Accesses pinned BPF maps directly using cilium/ebpf.
+// The Aya daemon (ebpfirewall start) must be running and have pinned
+// maps to /sys/fs/bpf/ebpfirewall/ before using this tool.
+//
+// Usage:
+//   sudo go run . -stats
+//   sudo go run . -block-ip 10.0.0.5
+//   sudo go run . -block-port 22 -proto tcp
+//   sudo go run . -list-ips
+
+package main
+
+import (
+	"encoding/binary"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"os"
+
+	"github.com/cilium/ebpf"
+)
+
+// Pin paths — must match constants in ebpfirewall/src/main.rs
+const (
+	pinDir      = "/sys/fs/bpf/ebpfirewall"
+	pinBlocklist = pinDir + "/BLOCKLIST_IPV4"
+	pinPorts    = pinDir + "/PORT_BLOCKLIST"
+	pinRules    = pinDir + "/FIREWALL_RULES"
+	pinStats    = pinDir + "/PACKET_STATS"
+)
+
+// Protocol masks — must match PROTO_* constants in ebpfirewall-common
+const (
+	protoTCP  = uint8(1)
+	protoUDP  = uint8(2)
+	protoBoth = protoTCP | protoUDP
+)
+
+// Action constants — must match ACTION_* in ebpfirewall-common
+const (
+	actionPass = uint32(0)
+	actionDrop = uint32(1)
+)
+
+// perCPUStats matches the PacketStats struct in ebpfirewall-common.
+// cilium/ebpf uses encoding/binary to deserialize PerCPU values.
+type perCPUStats struct {
+	Packets uint64
+	Bytes   uint64
+}
+
+// firewallKey matches FirewallKey in ebpfirewall-common (repr(C)).
+// All fields in host byte order.
+type firewallKey struct {
+	SrcIP    uint32
+	DstIP    uint32
+	SrcPort  uint16
+	DstPort  uint16
+	Protocol uint8
+	Pad      [3]uint8
+}
+
+func main() {
+	var (
+		flagBlockIP    = flag.String("block-ip", "", "Block source IP")
+		flagUnblockIP  = flag.String("unblock-ip", "", "Unblock source IP")
+		flagBlockPort  = flag.Uint("block-port", 0, "Block destination port (use with -proto)")
+		flagUnblockPort = flag.Uint("unblock-port", 0, "Unblock destination port")
+		flagProto      = flag.String("proto", "both", "Protocol: tcp|udp|both")
+		flagStats      = flag.Bool("stats", false, "Show packet statistics")
+		flagListIPs    = flag.Bool("list-ips", false, "List blocked IPs")
+	)
+	flag.Parse()
+
+	if os.Geteuid() != 0 {
+		log.Fatal("ebpfctl requires root (BPF map access)")
+	}
+
+	switch {
+	case *flagBlockIP != "":
+		blockIP(*flagBlockIP)
+	case *flagUnblockIP != "":
+		unblockIP(*flagUnblockIP)
+	case *flagBlockPort != 0:
+		blockPort(uint16(*flagBlockPort), *flagProto)
+	case *flagUnblockPort != 0:
+		unblockPort(uint16(*flagUnblockPort))
+	case *flagStats:
+		showStats()
+	case *flagListIPs:
+		listBlockedIPs()
+	default:
+		flag.Usage()
+		os.Exit(1)
+	}
+}
+
+// ─── IP blocklist ─────────────────────────────────────────────────────────
+
+func blockIP(ipStr string) {
+	ip := parseIPv4(ipStr)
+	m  := openMap(pinBlocklist)
+	defer m.Close()
+
+	// Key is the host-byte-order u32.
+	// binary.BigEndian.Uint32([1,2,3,4]) = 0x01020304 = u32::from(Ipv4Addr) in Rust.
+	key := binary.BigEndian.Uint32(ip)
+	if err := m.Put(key, uint32(0)); err != nil {
+		log.Fatalf("map insert: %v", err)
+	}
+	fmt.Printf("Blocked: %s\n", ipStr)
+}
+
+func unblockIP(ipStr string) {
+	ip := parseIPv4(ipStr)
+	m  := openMap(pinBlocklist)
+	defer m.Close()
+
+	key := binary.BigEndian.Uint32(ip)
+	if err := m.Delete(key); err != nil {
+		log.Fatalf("map delete: %v", err)
+	}
+	fmt.Printf("Unblocked: %s\n", ipStr)
+}
+
+func listBlockedIPs() {
+	m := openMap(pinBlocklist)
+	defer m.Close()
+
+	var key uint32
+	var val uint32
+	iter  := m.Iterate()
+	count := 0
+	for iter.Next(&key, &val) {
+		// key is host-byte-order u32; convert back to dotted-decimal
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, key)
+		fmt.Println(net.IP(b).String())
+		count++
+	}
+	if err := iter.Err(); err != nil {
+		log.Fatalf("map iterate: %v", err)
+	}
+	if count == 0 {
+		fmt.Println("(no blocked IPs)")
+	}
+}
+
+// ─── Port blocklist ───────────────────────────────────────────────────────
+
+func blockPort(port uint16, proto string) {
+	mask := parseMask(proto)
+	m    := openMap(pinPorts)
+	defer m.Close()
+
+	if err := m.Put(port, mask); err != nil {
+		log.Fatalf("map insert: %v", err)
+	}
+	fmt.Printf("Blocked port %d (%s)\n", port, proto)
+}
+
+func unblockPort(port uint16) {
+	m := openMap(pinPorts)
+	defer m.Close()
+
+	if err := m.Delete(port); err != nil {
+		log.Fatalf("map delete: %v", err)
+	}
+	fmt.Printf("Unblocked port %d\n", port)
+}
+
+// ─── Statistics ───────────────────────────────────────────────────────────
+
+func showStats() {
+	m := openMap(pinStats)
+	defer m.Close()
+
+	var passVals []perCPUStats
+	var dropVals []perCPUStats
+
+	if err := m.Lookup(uint32(0), &passVals); err != nil {
+		log.Fatalf("lookup pass: %v", err)
+	}
+	if err := m.Lookup(uint32(1), &dropVals); err != nil {
+		log.Fatalf("lookup drop: %v", err)
+	}
+
+	var totalPass, totalDrop uint64
+	for _, v := range passVals {
+		totalPass += v.Packets
+	}
+	for _, v := range dropVals {
+		totalDrop += v.Packets
+	}
+
+	fmt.Printf("%-12s %12d\n", "PASSED:", totalPass)
+	fmt.Printf("%-12s %12d\n", "DROPPED:", totalDrop)
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+func openMap(pin string) *ebpf.Map {
+	m, err := ebpf.LoadPinnedMap(pin, &ebpf.LoadPinOptions{})
+	if err != nil {
+		log.Fatalf(
+			"Cannot open pinned map %s: %v\n"+
+				"Hint: is `ebpfirewall start` running?",
+			pin, err,
+		)
+	}
+	return m
+}
+
+func parseIPv4(s string) net.IP {
+	ip := net.ParseIP(s).To4()
+	if ip == nil {
+		log.Fatalf("invalid IPv4 address: %s", s)
+	}
+	return ip
+}
+
+func parseMask(proto string) uint8 {
+	switch proto {
+	case "tcp":
+		return protoTCP
+	case "udp":
+		return protoUDP
+	case "both":
+		return protoBoth
+	default:
+		log.Fatalf("unknown proto '%s' — use tcp|udp|both", proto)
+		return 0
+	}
+}
+```
+
+---
+
+## Build and first run sequence
+
+```bash
+# 1. Pre-flight (run once on a fresh instance)
+bash scripts/verify_setup.sh
+
+# 2. Build — eBPF object first, then user-space
+make build
+
+# 3. Start the daemon (needs root for XDP attach + BPF pin)
+make run IFACE=eth1        # or: sudo RUST_LOG=info ./target/debug/ebpfirewall start
+
+# 4. In another terminal — Rust CLI
+sudo ./target/debug/ebpfirewall block-ip 10.0.0.100
+sudo ./target/debug/ebpfirewall stats
+sudo ./target/debug/ebpfirewall list-blocked-ips
+
+# 5. Go CLI (same machine, separate process — reads pinned maps)
+cd ebpfctl && go mod tidy
+sudo go run . -stats
+sudo go run . -block-ip 10.0.0.200
+sudo go run . -list-ips
+
+# 6. Verify XDP mode is native (not generic)
+ip link show eth1 | grep xdp
+# Should show: xdp (not xdpgeneric)
+
+# 7. Integration tests
+sudo make test IFACE=eth1
+```
+
+---
+
+## Key design decisions to understand
+
+**Byte order contract.** The XDP program calls `u32::from_be(src_addr)` to convert from wire (network) byte order to host byte order before every map lookup. Both the Rust CLI and Go CLI insert keys in host byte order. This is the canonical pattern from the Aya codebase and avoids the common bug where user-space inserts NBO and kernel reads NBO as-is on a LE BPF VM — they look the same value but compare differently because of how `u32` is stored in memory on x86.
+
+**Map pinning.** The daemon pins maps on start. CLI subcommands (`block-ip`, `stats`, etc.) access pinned maps directly without re-loading the BPF object. This is how production tools like Cilium and Falco work. You can add/remove rules while the daemon is running without restarting it.
+
+**PerCpuArray for stats.** Lock-free counter updates. Each CPU core writes to its own slot, eliminating false sharing on the cache line. User space aggregates by summing across all CPUs. Never use a regular array for high-frequency counters in XDP.
+
+**`_pad: [0u8; 3]` in FirewallKey.** The BPF verifier rejects map lookups with uninitialized bytes in the key. `FirewallKey` has protocol (u8) followed by 3 bytes of padding for alignment. These MUST be zeroed before every lookup. The `Default` derive initializes them to zero for you if you use `..Default::default()` or explicit `[0u8; 3]`.
+
+**`#[inline(always)]` on `ptr_at`.** The verifier does not track bounds across function call boundaries in older kernels. Always inline your bounds-check helper — otherwise the verifier cannot prove each access is safe and will reject the program.
