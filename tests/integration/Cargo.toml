@@ -1,0 +1,35 @@
+[package]
+name    = "ebpfirewall-ctrl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ebpfw-ctrl"
+path = "src/main.rs"
+
+[dependencies]
+# libbpf-rs: safe Rust bindings over the C libbpf library.
+# Handles loading BPF ELF objects, map access, and program attachment.
+libbpf-rs = "0.24"
+
+# Error handling
+anyhow = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Serialisation for the Unix-socket protocol (JSON lines)
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log        = "0.4"
+env_logger = "0.11"
+
+# Safe transmute between #[repr(C)] structs and byte slices —
+# avoids any unsafe code in the map-key/value serialisation.
+bytemuck = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+# Used in build.rs to invoke the kernel/ Makefile.
+# (No libbpf-cargo skeleton needed — we load the .o file directly.)
